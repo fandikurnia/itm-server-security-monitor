@@ -2,51 +2,67 @@
 
 # ============================================================
 # ITM Server Security Monitor
-# Interactive Shell Command Monitor
-# ============================================================
-#
-# Loaded globally from /etc/profile.d/sysadmin.sh
-#
-# Captures:
-#   - username
-#   - UID
-#   - SSH source IP
-#   - executed command
-#
-# Commands are written to system journal using logger.
-# Telegram delivery is handled separately by:
-#   itm-command-monitor.service
-#
+# Interactive Bash Command Monitor
 # ============================================================
 
-if [[ $- == *i* ]]; then
+# Only interactive Bash shells
+[[ $- != *i* ]] && return 0
 
-export PROMPT_COMMAND='
-history 1 | {
-    read -r x cmd
+itm_command_monitor() {
+    local cmd username uid source_ip original_user safe_cmd
 
-    if [ -n "$cmd" ] && [ "$cmd" != "$LAST_LOGGED_CMD" ]; then
+    cmd=$(history 1 | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]+//')
 
-        username=$(whoami)
-        uid=$(id -u)
+    [ -z "$cmd" ] && return 0
 
-        if [ -n "$SSH_CONNECTION" ]; then
-            source_ip="${SSH_CONNECTION%% *}"
-        else
-            source_ip="LOCAL"
-        fi
-
-        # Redact common credentials before logging/sending.
-        safe_cmd=$(printf "%s" "$cmd" | sed -E \
-            -e "s/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]=)[^ ]+/\1[REDACTED]/g" \
-            -e "s/([Tt][Oo][Kk][Ee][Nn]=)[^ ]+/\1[REDACTED]/g" \
-            -e "s/([Ss][Ee][Cc][Rr][Ee][Tt]=)[^ ]+/\1[REDACTED]/g" \
-            -e "s/([Aa][Pp][Ii][_-]?[Kk][Ee][Yy]=)[^ ]+/\1[REDACTED]/g")
-
-        logger -t itm-command-monitor -- \
-            "USER=${username} UID=${uid} SOURCE=${source_ip} COMMAND=${safe_cmd}"
-
-        export LAST_LOGGED_CMD="$cmd"
+    if [ "$cmd" = "${ITM_LAST_LOGGED_CMD:-}" ]; then
+        return 0
     fi
-}'
-fi
+
+    username=$(whoami)
+    uid=$(id -u)
+
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        source_ip="${SSH_CONNECTION%% *}"
+    else
+        source_ip="LOCAL"
+    fi
+
+    original_user="${SUDO_USER:-$username}"
+
+    #
+    # Best-effort secret redaction.
+    # Do NOT consider this a full DLP/secret scanner.
+    #
+    safe_cmd=$(printf '%s' "$cmd" | sed -E \
+        -e 's/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][=:])[^ ]+/\1[REDACTED]/g' \
+        -e 's/([Tt][Oo][Kk][Ee][Nn][=:])[^ ]+/\1[REDACTED]/g' \
+        -e 's/([Ss][Ee][Cc][Rr][Ee][Tt][=:])[^ ]+/\1[REDACTED]/g' \
+        -e 's/([Aa][Pp][Ii][_-]?[Kk][Ee][Yy][=:])[^ ]+/\1[REDACTED]/g' \
+        -e 's/(--password[= ]+)[^ ]+/\1[REDACTED]/g' \
+        -e 's/(--token[= ]+)[^ ]+/\1[REDACTED]/g' \
+        -e 's/(--api-key[= ]+)[^ ]+/\1[REDACTED]/g' \
+        -e 's/(Authorization:[[:space:]]*Bearer[[:space:]]+)[^ ]+/\1[REDACTED]/Ig')
+
+    logger -t itm-command-monitor -- \
+        "USER=${username} UID=${uid} ORIGINAL_USER=${original_user} SOURCE=${source_ip} COMMAND=${safe_cmd}"
+
+    ITM_LAST_LOGGED_CMD="$cmd"
+    export ITM_LAST_LOGGED_CMD
+}
+
+# Do not overwrite an existing PROMPT_COMMAND.
+# Add ITM monitor only once.
+case ";${PROMPT_COMMAND:-};" in
+    *";itm_command_monitor;"*)
+        ;;
+    *)
+        if [ -n "${PROMPT_COMMAND:-}" ]; then
+            PROMPT_COMMAND="${PROMPT_COMMAND};itm_command_monitor"
+        else
+            PROMPT_COMMAND="itm_command_monitor"
+        fi
+        ;;
+esac
+
+export PROMPT_COMMAND

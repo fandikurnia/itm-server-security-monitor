@@ -20,6 +20,29 @@ CHAT_ID="${CHAT_ID:-}"
 
 TELEGRAM_CONF="/etc/security-monitor/telegram.conf"
 
+# ============================================================
+# REQUIRED REPOSITORY FILES
+# ============================================================
+
+REQUIRED_FILES=(
+    "$SCRIPT_DIR/bin/security-notify"
+    "$SCRIPT_DIR/bin/ssh-login-alert"
+    "$SCRIPT_DIR/bin/security-file-monitor"
+    "$SCRIPT_DIR/bin/itm-command-profile"
+    "$SCRIPT_DIR/bin/itm-command-relay"
+    "$SCRIPT_DIR/systemd/security-file-monitor.service"
+    "$SCRIPT_DIR/systemd/itm-command-monitor.service"
+    "$SCRIPT_DIR/fail2ban/action.d/telegram-security.conf"
+    "$SCRIPT_DIR/fail2ban/jail.d/sshd.local"
+)
+
+for file in "${REQUIRED_FILES[@]}"; do
+    if [[ ! -f "$file" ]]; then
+        echo "[ERROR] Required repository file missing:"
+        echo "        $file"
+        exit 1
+    fi
+done
 
 # ============================================================
 # OS CHECK
@@ -30,7 +53,6 @@ if ! command -v apt-get >/dev/null 2>&1; then
     exit 1
 fi
 
-
 # ============================================================
 # PACKAGES
 # ============================================================
@@ -39,13 +61,12 @@ echo "[+] Installing required packages..."
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update
+apt-get update --allow-releaseinfo-change
 
 apt-get install -y \
     curl \
     inotify-tools \
     fail2ban
-
 
 # ============================================================
 # TIMEZONE
@@ -56,20 +77,19 @@ if command -v timedatectl >/dev/null 2>&1; then
     timedatectl set-timezone "$TZ_NAME" || true
 fi
 
-
 # ============================================================
 # TELEGRAM CONFIG
 # ============================================================
 
 echo "[+] Checking Telegram configuration..."
 
-install -d -o root -g root -m 700 /etc/security-monitor
+install -d -o root -g root -m 0700 /etc/security-monitor
 
 if [[ -f "$TELEGRAM_CONF" ]]; then
 
     echo "[+] Existing Telegram configuration found:"
     echo "    $TELEGRAM_CONF"
-    echo "[+] Existing BOT_TOKEN / CHAT_ID will be preserved."
+    echo "[+] Existing BOT_TOKEN / CHAT_ID preserved."
 
 else
 
@@ -77,71 +97,49 @@ else
         echo
         echo "[ERROR] Telegram configuration does not exist."
         echo
-        echo "First installation requires:"
+        echo "First installation:"
         echo
         echo "BOT_TOKEN='xxx' CHAT_ID='123' TZ_NAME='Asia/Jakarta' bash install.sh"
         echo
         exit 1
     fi
 
-    cat > "$TELEGRAM_CONF" <<EOF
+    cat > "$TELEGRAM_CONF" <<CFG
 BOT_TOKEN="${BOT_TOKEN}"
 CHAT_ID="${CHAT_ID}"
-EOF
-
-    chown root:root "$TELEGRAM_CONF"
-    chmod 600 "$TELEGRAM_CONF"
+CFG
 
     echo "[+] Telegram configuration created."
 fi
 
-
-# Always enforce correct permissions
 chown root:root "$TELEGRAM_CONF"
 chmod 600 "$TELEGRAM_CONF"
 
-
 # ============================================================
-# SECURITY NOTIFICATION SCRIPTS
+# INSTALL NOTIFICATION COMPONENTS
 # ============================================================
 
 echo "[+] Installing notification scripts..."
 
-install \
-    -o root \
-    -g root \
-    -m 0700 \
+install -o root -g root -m 0700 \
     "$SCRIPT_DIR/bin/security-notify" \
     /usr/local/sbin/security-notify
 
-install \
-    -o root \
-    -g root \
-    -m 0700 \
+install -o root -g root -m 0700 \
     "$SCRIPT_DIR/bin/ssh-login-alert" \
     /usr/local/sbin/ssh-login-alert
 
-install \
-    -o root \
-    -g root \
-    -m 0700 \
+install -o root -g root -m 0700 \
     "$SCRIPT_DIR/bin/security-file-monitor" \
     /usr/local/sbin/security-file-monitor
 
-
 # ============================================================
-# FILE MONITOR SYSTEMD
+# FILE MONITOR SERVICE
 # ============================================================
 
-echo "[+] Installing security file monitor..."
-
-install \
-    -o root \
-    -g root \
-    -m 0644 \
+install -o root -g root -m 0644 \
     "$SCRIPT_DIR/systemd/security-file-monitor.service" \
     /etc/systemd/system/security-file-monitor.service
-
 
 # ============================================================
 # FAIL2BAN
@@ -149,20 +147,13 @@ install \
 
 echo "[+] Installing Fail2Ban configuration..."
 
-install \
-    -o root \
-    -g root \
-    -m 0644 \
+install -o root -g root -m 0644 \
     "$SCRIPT_DIR/fail2ban/action.d/telegram-security.conf" \
     /etc/fail2ban/action.d/telegram-security.conf
 
-install \
-    -o root \
-    -g root \
-    -m 0644 \
+install -o root -g root -m 0644 \
     "$SCRIPT_DIR/fail2ban/jail.d/sshd.local" \
     /etc/fail2ban/jail.d/sshd.local
-
 
 # ============================================================
 # PAM SSH LOGIN ALERT
@@ -186,24 +177,17 @@ if [[ -f /etc/pam.d/sshd ]]; then
         echo "    $PAM_BACKUP"
 
     else
-
         echo "[+] SSH login PAM hook already installed."
-
     fi
-
 fi
 
-
 # ============================================================
-# COMMAND MONITOR FORENSIC PRESERVATION
+# PRESERVE OLD COMMAND MONITOR
 # ============================================================
 
-echo "[+] Installing ITM command monitoring..."
+echo "[+] Installing ITM command monitor..."
 
 if [[ -f /etc/profile.d/sysadmin.sh ]]; then
-
-    # Only make a forensic copy if installed file differs
-    # from the repository version.
 
     if ! cmp -s \
         /etc/profile.d/sysadmin.sh \
@@ -212,84 +196,107 @@ if [[ -f /etc/profile.d/sysadmin.sh ]]; then
         BACKUP_DIR="/root/forensic/security-monitor-install-$(date +%Y%m%d-%H%M%S)"
 
         mkdir -p "$BACKUP_DIR"
+        chmod 700 "$BACKUP_DIR"
 
         cp -a \
             /etc/profile.d/sysadmin.sh \
             "$BACKUP_DIR/sysadmin.sh.ORIGINAL"
 
-        stat \
-            /etc/profile.d/sysadmin.sh \
+        stat /etc/profile.d/sysadmin.sh \
             > "$BACKUP_DIR/sysadmin.sh.stat.txt"
 
-        sha256sum \
-            /etc/profile.d/sysadmin.sh \
+        sha256sum /etc/profile.d/sysadmin.sh \
             > "$BACKUP_DIR/sysadmin.sh.sha256.txt"
-
-        chmod 700 "$BACKUP_DIR"
 
         echo "[+] Existing sysadmin.sh preserved:"
         echo "    $BACKUP_DIR"
-
     else
-
-        echo "[+] Existing command monitor already matches repository."
-
+        echo "[+] Existing command profile already matches repository."
     fi
-
 fi
 
-
 # ============================================================
-# INSTALL GLOBAL COMMAND PROFILE
+# GLOBAL LOGIN SHELL COMMAND MONITOR
 # ============================================================
 
-install \
-    -o root \
-    -g root \
-    -m 0644 \
+install -o root -g root -m 0644 \
     "$SCRIPT_DIR/bin/itm-command-profile" \
     /etc/profile.d/sysadmin.sh
 
+echo "[+] Validating command profile..."
 
-# ============================================================
-# VALIDATE COMMAND PROFILE
-# ============================================================
-
-echo "[+] Validating command monitor syntax..."
-
-if ! bash -n /etc/profile.d/sysadmin.sh; then
-
-    echo "[ERROR] /etc/profile.d/sysadmin.sh syntax validation failed."
-    exit 1
-
-fi
+bash -n /etc/profile.d/sysadmin.sh
 
 echo "[+] Command profile syntax OK."
 
+# ============================================================
+# NON-LOGIN BASH SHELL SUPPORT
+#
+# Required for:
+#   sudo su
+#   bash
+#   interactive non-login root shells
+# ============================================================
+
+echo "[+] Enabling monitoring for non-login Bash shells..."
+
+BASHRC_FILE="/etc/bash.bashrc"
+BASHRC_MARKER="# ITM Server Security Monitor - command profile loader"
+BASHRC_SOURCE='source /etc/profile.d/sysadmin.sh'
+
+if [[ -f "$BASHRC_FILE" ]]; then
+
+    if ! grep -Fq "$BASHRC_MARKER" "$BASHRC_FILE"; then
+
+        BASHRC_BACKUP_DIR="/root/forensic/bashrc-monitor-$(date +%Y%m%d-%H%M%S)"
+
+        mkdir -p "$BASHRC_BACKUP_DIR"
+        chmod 700 "$BASHRC_BACKUP_DIR"
+
+        cp -a \
+            "$BASHRC_FILE" \
+            "$BASHRC_BACKUP_DIR/bash.bashrc.ORIGINAL"
+
+        stat "$BASHRC_FILE" \
+            > "$BASHRC_BACKUP_DIR/bash.bashrc.stat.txt"
+
+        sha256sum "$BASHRC_FILE" \
+            > "$BASHRC_BACKUP_DIR/bash.bashrc.sha256.txt"
+
+        cat >> "$BASHRC_FILE" <<'BASHRC'
+
+# ITM Server Security Monitor - command profile loader
+if [ -r /etc/profile.d/sysadmin.sh ]; then
+    source /etc/profile.d/sysadmin.sh
+fi
+BASHRC
+
+        echo "[+] /etc/bash.bashrc loader installed."
+        echo "[+] Original preserved:"
+        echo "    $BASHRC_BACKUP_DIR"
+
+    else
+        echo "[+] /etc/bash.bashrc loader already installed."
+    fi
+
+    bash -n "$BASHRC_FILE"
+fi
 
 # ============================================================
 # COMMAND RELAY
 # ============================================================
 
-install \
-    -o root \
-    -g root \
-    -m 0700 \
+install -o root -g root -m 0700 \
     "$SCRIPT_DIR/bin/itm-command-relay" \
     /usr/local/sbin/itm-command-relay
-
 
 # ============================================================
 # COMMAND MONITOR SYSTEMD SERVICE
 # ============================================================
 
-install \
-    -o root \
-    -g root \
-    -m 0644 \
+install -o root -g root -m 0644 \
     "$SCRIPT_DIR/systemd/itm-command-monitor.service" \
     /etc/systemd/system/itm-command-monitor.service
-
 
 # ============================================================
 # SYSTEMD
@@ -300,13 +307,10 @@ echo "[+] Reloading systemd..."
 systemctl daemon-reload
 
 systemctl enable --now security-file-monitor.service
-
-systemctl enable itm-command-monitor.service
-systemctl restart itm-command-monitor.service
-
+systemctl enable --now itm-command-monitor.service
 
 # ============================================================
-# FAIL2BAN VALIDATION
+# FAIL2BAN
 # ============================================================
 
 echo "[+] Validating Fail2Ban..."
@@ -315,7 +319,6 @@ fail2ban-client -t
 
 systemctl enable --now fail2ban
 systemctl restart fail2ban
-
 
 # ============================================================
 # VERIFICATION
@@ -326,63 +329,50 @@ echo "============================================================"
 echo " ITM Server Security Monitor - Verification"
 echo "============================================================"
 
-echo
-echo "[*] Telegram config:"
+check_result() {
+    local label="$1"
+    local result="$2"
+
+    printf "%-28s %s\n" "$label" "$result"
+}
+
 if [[ -f "$TELEGRAM_CONF" ]]; then
-    echo "    OK"
+    check_result "Telegram config:" "OK"
 else
-    echo "    MISSING"
+    check_result "Telegram config:" "MISSING"
 fi
 
-
-echo
-echo "[*] security-notify:"
 if [[ -x /usr/local/sbin/security-notify ]]; then
-    echo "    OK"
+    check_result "security-notify:" "OK"
 else
-    echo "    MISSING"
+    check_result "security-notify:" "MISSING"
 fi
 
-
-echo
-echo "[*] Command profile:"
 if bash -n /etc/profile.d/sysadmin.sh >/dev/null 2>&1; then
-    echo "    OK"
+    check_result "Command profile:" "OK"
 else
-    echo "    ERROR"
+    check_result "Command profile:" "ERROR"
 fi
 
-
-echo
-echo "[*] Command relay:"
 if systemctl is-active --quiet itm-command-monitor.service; then
-    echo "    ACTIVE"
+    check_result "Command relay:" "ACTIVE"
 else
-    echo "    FAILED"
+    check_result "Command relay:" "FAILED"
 fi
 
-
-echo
-echo "[*] File monitor:"
 if systemctl is-active --quiet security-file-monitor.service; then
-    echo "    ACTIVE"
+    check_result "File monitor:" "ACTIVE"
 else
-    echo "    FAILED"
+    check_result "File monitor:" "FAILED"
 fi
 
-
-echo
-echo "[*] Fail2Ban:"
 if systemctl is-active --quiet fail2ban; then
-    echo "    ACTIVE"
+    check_result "Fail2Ban:" "ACTIVE"
 else
-    echo "    FAILED"
+    check_result "Fail2Ban:" "FAILED"
 fi
 
-
-echo
 echo "============================================================"
-
 
 # ============================================================
 # TELEGRAM INSTALL TEST
@@ -392,18 +382,22 @@ echo "============================================================"
     "✅ ITM Security Monitor installed/updated successfully" \
     || true
 
-
 echo
 echo "Installation complete."
 echo
 echo "Useful checks:"
-echo
 echo "  systemctl status security-file-monitor --no-pager"
 echo "  systemctl status itm-command-monitor --no-pager"
 echo "  fail2ban-client status sshd"
 echo "  journalctl -t itm-command-monitor -n 20 --no-pager"
 echo
+echo "Command monitor tests:"
+echo "  Open a NEW SSH/login shell."
+echo "  Test: whoami"
+echo "  Test root: sudo su"
+echo "  Then run: whoami ; hostname ; uptime"
+echo
 echo "IMPORTANT:"
 echo "  Existing SSH authentication policy was NOT modified."
-echo "  Open a NEW login shell before testing command monitoring."
-echo
+echo "  Telegram credentials remain local in:"
+echo "  $TELEGRAM_CONF"
