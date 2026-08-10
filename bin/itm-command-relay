@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# ============================================================
+# ITM Server Security Monitor
+# Journal -> Telegram Command Relay
+# ============================================================
+
+set -u
+
+JOURNALCTL="$(command -v journalctl 2>/dev/null || true)"
+NOTIFY="/usr/local/sbin/security-notify"
+
+if [ -z "$JOURNALCTL" ]; then
+    echo "ERROR: journalctl not found"
+    exit 1
+fi
+
+if [ ! -x "$NOTIFY" ]; then
+    echo "ERROR: security-notify not found or not executable"
+    exit 1
+fi
+
+"$JOURNALCTL" \
+    -f \
+    -n 0 \
+    -t itm-command-monitor \
+    -o cat |
+while IFS= read -r line
+do
+    [ -z "$line" ] && continue
+
+    "$NOTIFY" "🖥️ COMMAND EXECUTED
+
+${line}"
+done

@@ -1,0 +1,20 @@
+[Unit]
+Description=ITM Shell Command Telegram Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+ExecStart=/usr/local/sbin/itm-command-relay
+
+User=root
+Group=root
+
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
