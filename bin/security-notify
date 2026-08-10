@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -u
+
+CONF="/etc/security-monitor/telegram.conf"
+
+if [[ ! -r "$CONF" ]]; then
+  echo "Config not found/readable: $CONF" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONF"
+
+: "${BOT_TOKEN:?BOT_TOKEN is required in $CONF}"
+: "${CHAT_ID:?CHAT_ID is required in $CONF}"
+
+MESSAGE="${*:-Security monitor event}"
+HOST="$(hostname -f 2>/dev/null || hostname)"
+NOW="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+# Discover global IPv4 addresses without assuming interface names.
+mapfile -t IPV4S < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u)
+PRIVATE_IPS=()
+PUBLIC_IPS=()
+for ipaddr in "${IPV4S[@]:-}"; do
+  case "$ipaddr" in
+    10.*|192.168.*) PRIVATE_IPS+=("$ipaddr") ;;
+    172.*)
+      second="${ipaddr#172.}"; second="${second%%.*}"
+      if [[ "$second" =~ ^[0-9]+$ ]] && (( second >= 16 && second <= 31 )); then
+        PRIVATE_IPS+=("$ipaddr")
+      else
+        PUBLIC_IPS+=("$ipaddr")
+      fi
+      ;;
+    127.*|169.254.*) ;;
+    *) PUBLIC_IPS+=("$ipaddr") ;;
+  esac
+done
+
+join_by_comma() { local IFS=", "; echo "$*"; }
+PRIVATE_IP="$(join_by_comma "${PRIVATE_IPS[@]:-}")"
+PUBLIC_IP="$(join_by_comma "${PUBLIC_IPS[@]:-}")"
+[[ -n "$PRIVATE_IP" ]] || PRIVATE_IP="-"
+[[ -n "$PUBLIC_IP" ]] || PUBLIC_IP="-"
+
+TEXT="🚨 SECURITY ALERT
+
+Server     : ${HOST}
+Private IP : ${PRIVATE_IP}
+Public IP  : ${PUBLIC_IP}
+Time       : ${NOW}
+
+${MESSAGE}"
+
+curl -fsS --max-time 10 \
+  -X POST \
+  "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${CHAT_ID}" \
+  --data-urlencode "text=${TEXT}" \
+  >/dev/null

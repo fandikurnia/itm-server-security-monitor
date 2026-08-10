@@ -1,0 +1,12 @@
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+logpath = /var/log/auth.log
+backend = auto
+maxretry = 5
+findtime = 10m
+bantime = 1h
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+action = iptables-multiport[name=SSHD, port="22", protocol=tcp]
+         telegram-security[name=SSHD]

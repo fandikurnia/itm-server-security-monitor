@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -u
+
+[[ "${PAM_TYPE:-}" == "open_session" ]] || exit 0
+[[ "${PAM_SERVICE:-}" == "sshd" ]] || exit 0
+
+USER_NAME="${PAM_USER:-unknown}"
+SOURCE_IP="${PAM_RHOST:-LOCAL}"
+TTY_NAME="${PAM_TTY:-unknown}"
+
+MESSAGE="🔐 SSH LOGIN SUCCESS
+
+User    : ${USER_NAME}
+Source  : ${SOURCE_IP}
+TTY     : ${TTY_NAME}
+Service : SSH"
+
+/usr/local/sbin/security-notify "$MESSAGE" || true
+exit 0
