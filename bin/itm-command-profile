@@ -8,8 +8,40 @@
 # Only interactive Bash shells
 [[ $- != *i* ]] && return 0
 
+# ============================================================
+# BASH HISTORY TIMESTAMPS
+#
+# Bash records the time of each entry in $HISTFILE as a
+# "#<epoch>" line directly above the command, and renders it
+# through HISTTIMEFORMAT whenever `history` is run.
+#
+# Only commands entered after this point are timestamped;
+# pre-existing history stays as-is.
+# ============================================================
+
+HISTTIMEFORMAT="%Y-%m-%d %H:%M:%S "
+
+# The default of 500 is too small to be useful as an audit trail.
+HISTSIZE=10000
+HISTFILESIZE=20000
+
+export HISTTIMEFORMAT HISTSIZE HISTFILESIZE
+
+# Append rather than overwrite, so concurrent sessions do not
+# discard each other's history on exit.
+shopt -s histappend
+
 itm_command_monitor() {
     local cmd username uid source_ip original_user safe_cmd
+
+    # Neutralise HISTTIMEFORMAT for the duration of this function.
+    # While it is set, `history 1` prefixes the timestamp to the
+    # command text, which would otherwise leak into COMMAND=.
+    local HISTTIMEFORMAT=
+
+    # Flush the command to $HISTFILE now instead of at logout, so
+    # the trail survives a session that is killed rather than exited.
+    history -a
 
     cmd=$(history 1 | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]+//')
 

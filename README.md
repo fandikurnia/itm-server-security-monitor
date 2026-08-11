@@ -9,6 +9,7 @@ Lightweight, self-hosted Linux security alerts to Telegram for Debian/Ubuntu ser
 - Fail2Ban SSH brute-force blocking + Telegram ban/unban notifications
 - Automatic server hostname, private IPv4, public IPv4 and local timezone in alerts
 - Watches SSH config/keys, account databases, sudoers, cron and systemd units
+- Timestamped `~/.bash_history` for every interactive shell, flushed per command so it survives killed sessions
 - No CrowdSec, SaaS subscription or cloud quota
 - Designed to also work inside LXC where `auditd` may not have kernel audit capabilities
 
