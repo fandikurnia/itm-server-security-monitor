@@ -55,6 +55,7 @@ AUDIT_MODULES=(
     audit_pam.sh
     audit_systemd.sh
     audit_command.sh
+    audit_ioc.sh
     audit_nginx.sh
     audit_php.sh
     audit_web.sh
@@ -73,6 +74,7 @@ AUDIT_IOC_FILES=(
     seo-poisoning-patterns.conf
     suspicious-filenames.conf
     web-exclusions.conf
+    known-iocs.conf
 )
 
 # Set to 0 to install the web monitoring without enabling the

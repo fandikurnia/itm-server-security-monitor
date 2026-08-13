@@ -202,6 +202,140 @@ $why" \
 }
 
 # ------------------------------------------------------------
+# Dormant pam_exec entries
+#
+# A commented out pam_exec line is inert TODAY. It is not
+# reassurance:
+#
+#   - it is proof that the hook was configured at some point
+#   - the payload it called is usually still on disk
+#   - re-arming it is one character of editing
+#
+# Real incident on this estate (formppid, 2026-08):
+#
+#   #auth optional pam_exec.so quiet expose_authtok \
+#        /usr/bin/x86_65-linux-gnu-op
+#
+# The line was commented, every "is pam_exec active?" check
+# passed, and the credential stealer binary was still sitting in
+# /usr/bin waiting to be re-enabled.
+#
+# A commented hook whose payload still exists is therefore
+# CRITICAL, not INFO.
+# ------------------------------------------------------------
+
+check_pam_exec_dormant() {
+
+    local file line stripped clean fields i opt target
+    local found=0 payload_present=0
+
+    [[ -d "$PAM_DIR" ]] || return 0
+
+    while IFS= read -r file; do
+
+        [[ -r "$file" ]] || continue
+
+        while IFS= read -r line; do
+
+            stripped="${line#"${line%%[![:space:]]*}"}"
+
+            # Only commented lines: active ones are handled by
+            # check_pam_exec.
+            [[ "$stripped" == \#* ]] || continue
+            [[ "$stripped" == *pam_exec.so* ]] || continue
+
+            # Strip the comment marker(s) and re-parse as PAM.
+            clean="${stripped#"${stripped%%[!#]*}"}"
+            clean="$(pam_strip_control "$clean")"
+            # shellcheck disable=SC2206
+            fields=( $clean )
+
+            target=""
+            local has_expose=0 module_seen=0
+            for (( i = 0; i < ${#fields[@]}; i++ )); do
+                opt="${fields[$i]}"
+                [[ "$opt" == *pam_exec.so ]] && { module_seen=1; continue; }
+                (( module_seen )) || continue
+                case "$opt" in
+                    expose_authtok) has_expose=1 ;;
+                    /*)             [[ -z "$target" ]] && target="$opt" ;;
+                esac
+            done
+
+            found=$(( found + 1 ))
+
+            local sev evidence action reasons confidence
+
+            if [[ -n "$target" && -e "$target" ]]; then
+
+                payload_present=1
+                sev=CRITICAL
+                confidence=95
+                reasons="A pam_exec hook was configured in the PAM stack and then commented out
+The program it called is STILL PRESENT on disk
+Re-enabling the hook requires deleting one '#'"
+                (( has_expose )) && reasons+="
+The hook used expose_authtok: it received cleartext authentication tokens"
+
+                evidence="Line: $(truncate_text "$stripped" 200)
+Payload: $(pam_inspect_helper "$target")
+The entry is inert right now. The capability is not: the payload is on disk and the configuration to invoke it was there long enough to be commented out rather than removed."
+
+                action="TREAT AS AN ACTIVE COMPROMISE. Do not delete the payload before capturing it: copy it and its metadata to /root/forensic and record the SHA256. Rotate every credential that authenticated on this host since the payload's mtime. Search for the persistence that re-installs it (cron, systemd, other PAM files, package hooks). Set HOST_TRUST_STATUS=\"UNTRUSTED\" in ${ITM_AUDIT_CONF}. This host needs a rebuild, not a cleanup."
+
+            elif [[ -n "$target" ]]; then
+
+                sev=HIGH
+                confidence=80
+                reasons="A pam_exec hook was configured and later commented out
+The program it called is no longer on disk
+This is residue of a previous compromise or of an incident response"
+                (( has_expose )) && reasons+="
+The hook used expose_authtok: credentials were exposed to it while it was active"
+
+                evidence="Line: $(truncate_text "$stripped" 200)
+Payload ${target} is absent from disk."
+
+                action="Confirm this is the remnant of a cleanup you performed. If it is not, the host was compromised and the payload has been removed by someone else. Either way the credentials that authenticated while the hook was live must be considered exposed, and the host trust status must reflect the incident."
+
+            else
+
+                sev=MEDIUM
+                confidence=60
+                reasons="A commented pam_exec entry exists with no resolvable program path"
+                evidence="Line: $(truncate_text "$stripped" 200)"
+                action="Review the PAM file history to establish what this hook called."
+            fi
+
+            add_finding "$sev" \
+                "Dormant pam_exec hook in the PAM stack (commented, payload $( [[ -n "$target" && -e "$target" ]] && echo "STILL PRESENT" || echo "absent" ))" \
+                id="pam-dormant-exec:$file:$target" \
+                path="$file" \
+                hash="$( [[ -n "$target" && -f "$target" ]] && file_sha256 "$target" )" \
+                confidence="$confidence" \
+                reasons="$reasons" \
+                process="pam file: $file -> ${target:-<no path argument>}" \
+                evidence="$evidence" \
+                action="$action"
+
+            if [[ -n "$target" && -f "$target" ]]; then
+                evidence_snapshot "$target" \
+                    "$(printf '%s|pam-dormant|%s' "$ITM_HOSTNAME" "$target" | sha256sum | cut -c1-32)" \
+                    "dormant pam_exec payload referenced from $file" >/dev/null
+            fi
+
+        done < "$file"
+
+    done < <(find "$PAM_DIR" -maxdepth 1 -type f 2>/dev/null | sort)
+
+    if (( found == 0 )); then
+        add_pass "no commented or dormant pam_exec entry in $PAM_DIR"
+    elif (( payload_present == 0 )); then
+        add_pass "dormant pam_exec entries found, none with a payload still on disk"
+    fi
+}
+
+# ------------------------------------------------------------
 # Modules loaded from outside the PAM module directory
 # ------------------------------------------------------------
 
@@ -350,6 +484,7 @@ run_audit_pam() {
     fi
 
     check_pam_exec
+    check_pam_exec_dormant
     check_pam_module_paths
     check_pam_binaries
     check_pam_changes

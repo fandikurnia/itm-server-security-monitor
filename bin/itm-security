@@ -63,7 +63,7 @@ source "$ITM_LIB_DIR/itm-audit-common.sh"
 # this host has a web application workload before touching the
 # filesystem. nginx runs before php/web/webshell because those
 # consume the document roots and FastCGI targets it discovers.
-ITM_ALL_MODULES="role process network pam systemd command nginx php web webshell gambling seo integrity fail2ban"
+ITM_ALL_MODULES="role process network pam systemd command ioc nginx php web webshell gambling seo integrity fail2ban"
 
 module_file() {
     case "$1" in
@@ -73,6 +73,7 @@ module_file() {
         pam)      printf '%s' "audit_pam.sh" ;;
         systemd)  printf '%s' "audit_systemd.sh" ;;
         command)  printf '%s' "audit_command.sh" ;;
+        ioc)      printf '%s' "audit_ioc.sh" ;;
         nginx)    printf '%s' "audit_nginx.sh" ;;
         php)      printf '%s' "audit_php.sh" ;;
         web)      printf '%s' "audit_web.sh" ;;
@@ -103,6 +104,8 @@ Modules:
   pam         PAM stack integrity, pam_exec credential capture
   systemd     malicious unit persistence
   command     wrapper binaries hiding processes, ports and files
+  ioc         unpackaged binaries in system directories, known IOC
+              paths/hashes/domains, ld.so.preload injection
   nginx       PHP execution in upload/data document roots
   php         PHP-FPM versions, pools and production settings
   web         web filesystem: webshells, artefacts, permissions

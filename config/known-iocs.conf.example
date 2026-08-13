@@ -1,0 +1,75 @@
+# ============================================================
+# ITM Server Security Monitor
+# Known indicators of compromise
+#
+# Installed to /etc/security-monitor/ioc/known-iocs.conf
+#
+# Indicators recovered from confirmed incidents on this estate.
+# Checking them costs almost nothing and turns one host's
+# incident into fleet wide detection: the same payload is
+# normally dropped on every server the intruder reached.
+#
+# Format, one indicator per line:
+#
+#   path:/absolute/path            file present on disk    -> CRITICAL
+#   sha256:<64 hex>                content match, any name -> CRITICAL
+#   domain:evil.example            C2 domain or host       -> CRITICAL
+#   string:/some/uri/path          C2 URI or unique marker -> CRITICAL
+#
+# Domains and strings are searched in system binary
+# directories, PAM/systemd/cron configuration and the web roots
+# - not across the whole filesystem.
+#
+# IMPORTANT
+#
+# This list only ever describes the LAST attack. The generic
+# check in the same module - an executable in a system binary
+# directory that no package owns - is what catches the next
+# one, and it needs no entries here.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# INCIDENT: formppid.kemenpora.go.id, 2026-08
+#
+# PAM credential stealer. A pam_exec.so hook with
+# expose_authtok in /etc/pam.d/common-auth piped the cleartext
+# authentication token to a payload in /usr/bin, which posted
+# it to an external server with curl.
+#
+# The payload name imitates the Debian toolchain triplet:
+#
+#   real   x86_64-linux-gnu-*
+#   payload x86_65-linux-gnu-op      <- 4 changed to 5
+#
+# By the time it was found the PAM line had been COMMENTED OUT
+# while the payload was left in place, so every check that only
+# asked "is a pam_exec hook active?" reported the host clean.
+#
+# The dormant-hook check in the PAM module and the unpackaged
+# binary sweep in the IOC module both exist because of this
+# incident.
+# ------------------------------------------------------------
+
+path:/usr/bin/x86_65-linux-gnu-op
+
+domain:petupmanluy.xyz
+
+string:/sudo/socket.php
+
+# Record the payload hash once it has been captured from the
+# affected host, so a renamed copy is still detected elsewhere:
+# sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+
+# ------------------------------------------------------------
+# INCIDENT: previous estate compromise
+#
+# Fake systemd units with binaries dropped into /usr/bin, and
+# wrapper binaries in /usr/local/bin hiding processes and
+# ports. Unit names are matched by the systemd module through
+# KNOWN_BAD_UNITS in audit.conf; any payload paths recovered
+# from those hosts belong here.
+# ------------------------------------------------------------
+
+# path:/usr/bin/<payload name once recovered>
