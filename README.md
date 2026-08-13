@@ -144,6 +144,7 @@ present, `1` usage or environment error.
 | `pam` | active `pam_exec.so` hooks, `expose_authtok` credential capture, helpers containing `curl`/`wget`/`base64`, PAM modules loaded from outside the module directory, unpackaged `.so` files |
 | `systemd` | units executing from temp or home directories, unpackaged binaries in `/usr/bin`, units pointing at deleted executables, name masquerading, network commands wired into `Exec=` |
 | `command` | wrapper binaries shadowing `ps`, `ss`, `netstat`, `lsof`, `strings`, `strace`; shell aliases redefining forensic tools; history suppression |
+| `ioc` | **executables in system binary directories that no package owns**, known IOC paths/hashes/domains from previous incidents, `/etc/ld.so.preload` injection |
 | `nginx` | parses `nginx -T`; flags any server block whose document root is an upload/data directory **and** has a PHP/FastCGI handler; unanchored `\.php` locations; `autoindex`; missing dot-file deny |
 | `php` | multiple or unsupported FPM versions, pools not referenced by any vhost, `allow_url_include`, `display_errors`, `cgi.fix_pathinfo`, `open_basedir`, pools running as root |
 | `web` | PHP files inside upload directories, webshell signatures, PHP code embedded in static uploads, exposed `.env`/`.git`/database dumps, SUID files and world-writable directories under the web root |
@@ -277,6 +278,57 @@ webshell frequently deletes itself, and that copy may be the only record left.
 
 The original file is **never** moved, renamed, quarantined, chmod'ed or deleted,
 and never executed.
+
+### Dormant persistence and the IOC hunt
+
+A finding from `formppid.kemenpora.go.id` (August 2026) drove two checks that are
+worth explaining, because the first version of this tool would have missed it:
+
+```
+#auth optional pam_exec.so quiet expose_authtok /usr/bin/x86_65-linux-gnu-op
+```
+
+The PAM hook was **commented out**. The payload was **still in `/usr/bin`**. Every
+check that asks "is a `pam_exec` hook active?" reports the host clean — and the
+credential stealer is one deleted `#` away from running again.
+
+Note the filename: `x86_65-linux-gnu-op`. The real Debian toolchain prefix is
+`x86_64-linux-gnu`. One digit changed, and it reads as ordinary in a directory
+listing of 3000 binaries.
+
+Two checks came out of this:
+
+- **`pam` — dormant hooks.** Commented `pam_exec` lines are parsed too. If the
+  program they call still exists on disk the finding is CRITICAL, not
+  informational: the configuration was there long enough to be commented rather
+  than removed, and the capability is intact.
+- **`ioc` — unpackaged system binaries.** On a package-managed server every
+  binary in `/usr/bin` belongs to a package. The exceptions are few, local, and
+  known to the administrator. This check needs no threat intelligence and no IOC
+  list, and it is what catches the *next* payload. In testing it scored this one
+  at CRITICAL/99% from the generic signals alone (unowned + toolchain-lookalike
+  name + script + network strings).
+
+The IOC database at `/etc/security-monitor/ioc/known-iocs.conf` turns one host's
+incident into fleet-wide detection — the same payload is usually dropped on every
+server the intruder reached:
+
+```
+path:/usr/bin/x86_65-linux-gnu-op
+domain:petupmanluy.xyz
+string:/sudo/socket.php
+sha256:<captured from the affected host>
+```
+
+Sweeping every host on the estate:
+
+```bash
+itm-security audit ioc          # ~10s; nightly audit includes it
+```
+
+The sweep walks the system binary directories only (not the whole filesystem),
+resolves package ownership in batched queries, and is part of the nightly audit
+rather than the three-hourly web scan.
 
 ### Detection philosophy
 
