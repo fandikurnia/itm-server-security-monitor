@@ -357,6 +357,17 @@ run_audit_nginx() {
 
     module_begin "nginx" "Nginx PHP Exposure"
 
+    # An Nginx configuration audit is still meaningful on a
+    # reverse proxy or static host, so this module only needs a
+    # web server, not a web application.
+    if ! role_is web_server 2>/dev/null; then
+        add_na "Nginx configuration audit: NOT APPLICABLE - no web server on this host" \
+            id="na:nginx" \
+            action="No action. System level auditing continues normally."
+        module_end
+        return 0
+    fi
+
     if check_nginx_config_state; then
         check_php_in_upload_roots
         check_php_location_anchoring

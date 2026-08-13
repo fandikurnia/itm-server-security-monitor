@@ -43,7 +43,13 @@ AUDIT_MODULE_DIR="$AUDIT_LIB_DIR/modules"
 AUDIT_LOG_DIR="/var/log/itm-security"
 AUDIT_STATE_DIR="/var/lib/itm-security/audit-state"
 
+AUDIT_IOC_DIR="/etc/security-monitor/ioc"
+WEB_BASELINE_DIR="/var/lib/itm-security/web-baseline"
+WEB_SCAN_STATE_DIR="/var/lib/itm-security/scan-state"
+WEB_EVIDENCE_DIR="/var/lib/itm-security/evidence"
+
 AUDIT_MODULES=(
+    audit_role.sh
     audit_process.sh
     audit_network.sh
     audit_pam.sh
@@ -52,8 +58,26 @@ AUDIT_MODULES=(
     audit_nginx.sh
     audit_php.sh
     audit_web.sh
+    audit_webshell.sh
+    audit_gambling.sh
+    audit_seo.sh
+    audit_integrity.sh
     audit_fail2ban.sh
 )
+
+# IOC databases. Installed only when absent, so operator tuning
+# and site specific allowlists are never overwritten.
+AUDIT_IOC_FILES=(
+    gambling-keywords.conf
+    webshell-patterns.conf
+    seo-poisoning-patterns.conf
+    suspicious-filenames.conf
+    web-exclusions.conf
+)
+
+# Set to 0 to install the web monitoring without enabling the
+# three hourly scan or the realtime watcher.
+INSTALL_WEB_MONITOR="${INSTALL_WEB_MONITOR:-1}"
 
 # Set INSTALL_AUDIT_TIMER=0 to install the audit tooling without
 # enabling the nightly run.
@@ -78,7 +102,16 @@ REQUIRED_FILES=(
     "$SCRIPT_DIR/systemd/itm-security-audit.service"
     "$SCRIPT_DIR/systemd/itm-security-audit.timer"
     "$SCRIPT_DIR/logrotate/itm-security"
+    "$SCRIPT_DIR/lib/itm-web-common.sh"
+    "$SCRIPT_DIR/bin/itm-web-realtime"
+    "$SCRIPT_DIR/systemd/itm-web-scan.service"
+    "$SCRIPT_DIR/systemd/itm-web-scan.timer"
+    "$SCRIPT_DIR/systemd/itm-web-realtime.service"
 )
+
+for ioc in "${AUDIT_IOC_FILES[@]}"; do
+    REQUIRED_FILES+=("$SCRIPT_DIR/config/${ioc}.example")
+done
 
 for module in "${AUDIT_MODULES[@]}"; do
     REQUIRED_FILES+=("$SCRIPT_DIR/modules/$module")
@@ -359,11 +392,26 @@ done
 install \
     -o root \
     -g root \
+    -m 0600 \
+    "$SCRIPT_DIR/lib/itm-web-common.sh" \
+    "$AUDIT_LIB_DIR/itm-web-common.sh"
+
+install \
+    -o root \
+    -g root \
     -m 0700 \
     "$SCRIPT_DIR/bin/itm-security" \
     /usr/local/sbin/itm-security
 
+install \
+    -o root \
+    -g root \
+    -m 0700 \
+    "$SCRIPT_DIR/bin/itm-web-realtime" \
+    /usr/local/sbin/itm-web-realtime
+
 bash -n /usr/local/sbin/itm-security
+bash -n /usr/local/sbin/itm-web-realtime
 
 echo "[+] Audit modules installed: ${#AUDIT_MODULES[@]}"
 
@@ -376,6 +424,35 @@ echo "[+] Audit modules installed: ${#AUDIT_MODULES[@]}"
 
 install -o root -g root -m 0750 -d "$AUDIT_LOG_DIR"
 install -o root -g root -m 0700 -d "$AUDIT_STATE_DIR"
+install -o root -g root -m 0700 -d "$WEB_BASELINE_DIR"
+install -o root -g root -m 0700 -d "$WEB_SCAN_STATE_DIR"
+install -o root -g root -m 0700 -d "$WEB_EVIDENCE_DIR"
+
+# ------------------------------------------------------------
+# IOC databases
+#
+# Keyword and pattern lists live outside the modules so they can
+# be tuned per site. Existing files are never overwritten: an
+# operator's allowlist is not the installer's to discard.
+# ------------------------------------------------------------
+
+install -o root -g root -m 0700 -d "$AUDIT_IOC_DIR"
+
+for ioc in "${AUDIT_IOC_FILES[@]}"; do
+
+    if [[ -f "$AUDIT_IOC_DIR/$ioc" ]]; then
+        echo "[+] Existing IOC list preserved: $ioc"
+    else
+        install \
+            -o root \
+            -g root \
+            -m 0600 \
+            "$SCRIPT_DIR/config/${ioc}.example" \
+            "$AUDIT_IOC_DIR/$ioc"
+        echo "[+] IOC list installed: $ioc"
+    fi
+
+done
 
 # ------------------------------------------------------------
 # Audit configuration
@@ -479,6 +556,27 @@ install \
     -m 0644 \
     "$SCRIPT_DIR/systemd/itm-security-audit.timer" \
     /etc/systemd/system/itm-security-audit.timer
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-web-scan.service" \
+    /etc/systemd/system/itm-web-scan.service
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-web-scan.timer" \
+    /etc/systemd/system/itm-web-scan.timer
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-web-realtime.service" \
+    /etc/systemd/system/itm-web-realtime.service
 
 # ============================================================
 # SSH LOGIN PAM ALERT
@@ -799,6 +897,37 @@ else
 
 fi
 
+# ------------------------------------------------------------
+# Web content monitoring
+#
+# Two layers:
+#   itm-web-scan.timer      reconciliation every three hours
+#   itm-web-realtime        inotify, catches a file that exists
+#                           for only a few minutes
+#
+# Both are role aware: on a host with no web application
+# workload the scan exits after a lightweight classification and
+# the realtime watcher exits 0 without watching anything.
+# ------------------------------------------------------------
+
+if [[ "$INSTALL_WEB_MONITOR" == "1" ]]; then
+
+    systemctl enable --now itm-web-scan.timer
+
+    if command -v inotifywait >/dev/null 2>&1; then
+        systemctl enable --now itm-web-realtime.service
+        echo "[+] Web scan timer and realtime monitor enabled."
+    else
+        echo "[!] inotify-tools missing - realtime web monitor NOT started."
+        echo "    Scheduled scanning still runs every three hours."
+    fi
+
+else
+
+    echo "[+] Web monitoring NOT enabled (INSTALL_WEB_MONITOR=0)."
+
+fi
+
 # ============================================================
 # FAIL2BAN VALIDATION
 # ============================================================
@@ -900,6 +1029,30 @@ else
     check_result "Audit config:" "MISSING"
 fi
 
+if [[ "$INSTALL_WEB_MONITOR" == "1" ]]; then
+    if systemctl is-active --quiet itm-web-scan.timer; then
+        check_result "Web scan timer:" "ACTIVE (00,03,06,09,12,15,18,21)"
+    else
+        check_result "Web scan timer:" "FAILED"
+    fi
+
+    if systemctl is-active --quiet itm-web-realtime.service; then
+        check_result "Realtime web monitor:" "ACTIVE"
+    elif command -v inotifywait >/dev/null 2>&1; then
+        check_result "Realtime web monitor:" "NOT APPLICABLE (no web workload)"
+    else
+        check_result "Realtime web monitor:" "inotify-tools MISSING"
+    fi
+else
+    check_result "Web monitoring:" "DISABLED BY OPERATOR"
+fi
+
+IOC_FOUND="$(find "$AUDIT_IOC_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)"
+check_result "IOC lists:" "$IOC_FOUND / ${#AUDIT_IOC_FILES[@]}"
+
+HOST_ROLE_LINE="$(/usr/local/sbin/itm-security audit role --dry-run --quiet 2>/dev/null | grep -m1 'host role:' || true)"
+check_result "Host role:" "${HOST_ROLE_LINE#*host role: }"
+
 check_result "Host trust status:" \
     "$(grep -E '^HOST_TRUST_STATUS=' "$AUDIT_CONF" 2>/dev/null | cut -d'"' -f2 || echo UNVERIFIED)"
 
@@ -953,6 +1106,10 @@ echo "  itm-security audit"
 echo "  itm-security audit nginx web     # single modules"
 echo "  itm-security audit --json | jq ."
 echo
+echo "  itm-security web status"
+echo "  itm-security web baseline        # after a verified clean deployment"
+echo "  systemctl status itm-web-realtime --no-pager"
+echo "  systemctl list-timers itm-web-scan.timer"
 echo "  systemctl list-timers itm-security-audit.timer"
 echo "  less $AUDIT_LOG_DIR/post-compromise-audit.log"
 echo

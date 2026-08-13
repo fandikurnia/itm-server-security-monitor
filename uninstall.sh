@@ -71,6 +71,9 @@ remove_marker_block() {
 echo "[+] Stopping services..."
 
 for unit in \
+    itm-web-realtime.service \
+    itm-web-scan.timer \
+    itm-web-scan.service \
     itm-security-audit.timer \
     itm-security-audit.service \
     itm-command-monitor.service \
@@ -117,7 +120,8 @@ rm -f \
     /usr/local/sbin/ssh-login-alert \
     /usr/local/sbin/security-file-monitor \
     /usr/local/sbin/itm-command-relay \
-    /usr/local/sbin/itm-security
+    /usr/local/sbin/itm-security \
+    /usr/local/sbin/itm-web-realtime
 
 rm -rf /usr/local/lib/itm-security
 
@@ -157,6 +161,19 @@ if (( PURGE )); then
         [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").ORIGINAL"
     done
 
+    # Tuned IOC lists and the integrity baseline represent real
+    # operator work; keep a copy even when purging.
+    [[ -d /etc/security-monitor/ioc ]] \
+        && cp -a /etc/security-monitor/ioc "$BACKUP_DIR/ioc"
+
+    [[ -d /var/lib/itm-security/web-baseline ]] \
+        && cp -a /var/lib/itm-security/web-baseline "$BACKUP_DIR/web-baseline"
+
+    # Evidence copies of suspected malicious files are forensic
+    # material and are preserved in the backup directory.
+    [[ -d /var/lib/itm-security/evidence ]] \
+        && cp -a /var/lib/itm-security/evidence "$BACKUP_DIR/evidence"
+
     if [[ -d /var/log/itm-security ]]; then
         cp -a /var/log/itm-security "$BACKUP_DIR/itm-security-logs"
     fi
@@ -170,14 +187,18 @@ if (( PURGE )); then
 
 else
 
-    rm -rf /var/lib/itm-security/audit-state
+    rm -rf /var/lib/itm-security/audit-state /var/lib/itm-security/scan-state
+    rm -f  /var/lib/itm-security/host-role.conf
 
     echo
     echo "[+] Kept intentionally:"
     echo "      /etc/security-monitor/telegram.conf"
     echo "      /etc/security-monitor/audit.conf"
     echo "      /etc/security-monitor/trusted_networks.conf"
-    echo "      /var/log/itm-security/    (audit evidence)"
+    echo "      /etc/security-monitor/ioc/          (tuned IOC lists)"
+    echo "      /var/lib/itm-security/web-baseline/ (integrity baseline)"
+    echo "      /var/lib/itm-security/evidence/     (captured suspect files)"
+    echo "      /var/log/itm-security/              (audit evidence)"
     echo
     echo "    Remove them with: bash uninstall.sh --purge"
 

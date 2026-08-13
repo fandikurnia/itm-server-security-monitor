@@ -345,6 +345,8 @@ run_audit_php() {
 
     module_begin "php" "PHP-FPM Posture"
 
+    require_web_workload "PHP-FPM audit" || { module_end; return 0; }
+
     if ! have_cmd php && ! find /etc/php -maxdepth 1 -type d 2>/dev/null | grep -q .; then
         add_skip "PHP does not appear to be installed"
         module_end

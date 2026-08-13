@@ -138,6 +138,7 @@ present, `1` usage or environment error.
 
 | Module | What it looks for |
 |---|---|
+| `role` | host workload classification; gates every web module (see below) |
 | `process` | deleted and `memfd` executables, execution from `/tmp` or another account's home, unpackaged root binaries, shells spawned by Nginx/PHP-FPM, **PIDs visible in `/proc` but hidden from `ps`** |
 | `network` | listener inventory, database ports beyond loopback, root-owned egress outside the trusted networks, **ports listening in the kernel but hidden from `ss`** |
 | `pam` | active `pam_exec.so` hooks, `expose_authtok` credential capture, helpers containing `curl`/`wget`/`base64`, PAM modules loaded from outside the module directory, unpackaged `.so` files |
@@ -151,6 +152,131 @@ present, `1` usage or environment error.
 The `nginx` module runs before `php` and `web` and hands them the document roots
 and FastCGI targets it discovered, so a PHP file in an upload directory is
 escalated to CRITICAL when Nginx is confirmed to execute it.
+
+### Web content monitoring
+
+Four content modules target the way public-sector sites are actually abused in
+this region: injected gambling/slot landing pages, SEO poisoning, and PHP
+webshells dropped through upload forms.
+
+| Module | Detects |
+|---|---|
+| `webshell` | webshells scored by content + location + owner + age, double extensions (`foto.jpg.php`), PHP inside upload directories, polyglot uploads, **writable directories that also execute PHP**, POST→GET upload-execute correlation in the access log, interpreters spawned by PHP-FPM |
+| `gambling` | judi/slot injection scored by keyword **density** plus hidden markup, link farms, redirects and obfuscated JavaScript; doorway page bursts |
+| `seo` | cloaking (branching on Googlebot's User-Agent), Referer-conditional redirects, external `canonical`/`<base href>`, hidden anchors, spam vocabulary in `<title>`/`<meta>`, **Japanese keyword hack** (CJK text in metadata), poisoned `robots.txt`/`sitemap.xml`/`.htaccess` |
+| `integrity` | SHA256 baseline of application source → `CREATED`, `MODIFIED`, `DELETED`, `OWNER_CHANGED`, `PERMISSION_CHANGED` |
+
+**Nothing is ever a detection on a single indicator.** Every content finding is
+scored, and the score, the confidence and the individual reasons are all in the
+report and in the JSON:
+
+```text
+[CRITICAL] Gambling / judi slot content in web content (confidence 99%)
+           path    : /website/deputi1/web/promo.html
+           reasons :
+                     - 12 distinct gambling terms in one file (+55)
+                     - hidden markup (display:none / off-screen / zero font) (+30)
+                     - outbound redirect in the same file (+25)
+                     - obfuscated JavaScript in the same file (+25)
+                     - written in the last 0h (+20)
+```
+
+The same engine keeps a legitimate news article that mentions *judi online* once
+at `LOW`/`INFO` instead of alerting on it. Thresholds are tunable
+(`SCORE_THRESHOLD_*`), and every keyword and pattern lives in a config file, not
+in the code:
+
+```
+/etc/security-monitor/ioc/gambling-keywords.conf
+/etc/security-monitor/ioc/webshell-patterns.conf
+/etc/security-monitor/ioc/seo-poisoning-patterns.conf
+/etc/security-monitor/ioc/suspicious-filenames.conf
+/etc/security-monitor/ioc/web-exclusions.conf     ← confirmed false positives
+```
+
+The installer never overwrites a tuned list.
+
+### Two detection layers
+
+A webshell uploaded at 10:01 and deleted at 10:10 is invisible to a 09:00 and a
+12:00 scan. That is why there are two layers, and why neither is sufficient
+alone:
+
+```
+File CREATE/MODIFY ──► itm-web-realtime.service  (inotify)
+                       classify → hash → evidence copy → Telegram
+                       within seconds
+
+00,03,06,09,12,15,18,21 ──► itm-web-scan.timer
+                       full/incremental reconciliation:
+                       webshell · gambling · SEO · integrity · nginx
+                       catches whatever realtime missed
+```
+
+The realtime watcher excludes session, cache and `node_modules` trees — not only
+for noise, but because recursive watches on them would exhaust the kernel's
+inotify limit. The scheduled scan is incremental between full passes
+(`WEB_FULL_SCAN_HOURS`), so a routine run only examines what changed.
+
+```bash
+systemctl status itm-web-realtime --no-pager
+systemctl list-timers itm-web-scan.timer
+itm-security web status
+itm-security web baseline     # after a verified clean deployment
+itm-security web changes
+```
+
+### Host role awareness
+
+Before any module touches the disk, the `role` module classifies the host from
+listening sockets, service states and command presence — no filesystem walk. The
+result is cached and only recomputed when the host's service/port signature
+changes.
+
+Web content modules run **only** where there is a real web application workload:
+
+```text
+Host Role Detection
+  Web Application          : NO
+  Web Server               : none
+  Container Host           : YES
+
+Nginx PHP Exposure   : NOT APPLICABLE
+Webshell Detection   : NOT APPLICABLE
+Gambling Injection   : NOT APPLICABLE
+SEO Poisoning        : NOT APPLICABLE
+Source Integrity     : NOT APPLICABLE
+```
+
+`NOT APPLICABLE` is deliberately not `PASS`: nothing was examined, and the report
+says so. System-level auditing (process, network, PAM, systemd, command, SSH,
+Fail2Ban) runs everywhere regardless.
+
+Three distinctions the classifier makes, each of which would otherwise cause a
+pointless disk-wide scan:
+
+- **Web application vs web management interface** — Proxmox on 8006, Cockpit,
+  Webmin are infrastructure UI. Proxmox is classified as a hypervisor and gets no
+  PHP/SEO/gambling/webshell scanning at all.
+- **Installed vs serving** — `php-cli` being present is not a PHP workload. PHP
+  must be wired to a web server (`fastcgi_pass`, or an Apache PHP module). A Node
+  binary is not a Node workload; a Node *service* listening on TCP is.
+- **Host vs container** — on a Docker/k3s host, `pgrep nginx` finds the
+  containers' processes. Those are the image's workload, not this host's, and the
+  host has no document root for them. Only host-namespace processes count.
+
+Override with `WEB_WORKLOAD_OVERRIDE="yes"|"no"|"auto"` in `audit.conf` when
+detection cannot see your setup.
+
+### Evidence handling
+
+For every HIGH/CRITICAL file finding the audit copies the file to
+`/var/lib/itm-security/evidence/YYYYMMDD/` (root-only, `0600`) with a `.meta`
+sidecar recording path, hash, ownership, permissions and timestamps — because a
+webshell frequently deletes itself, and that copy may be the only record left.
+
+The original file is **never** moved, renamed, quarantined, chmod'ed or deleted,
+and never executed.
 
 ### Detection philosophy
 
@@ -215,11 +341,11 @@ The JSON file is newline-delimited rather than one rewritten array, so Wazuh,
 Filebeat or Vector can tail it directly and history is never lost. `--json`
 prints a proper JSON array on stdout for `jq` and API use.
 
-Each record carries: `timestamp`, `hostname`, `module`, `severity`, `status`,
-`finding`, `path`, `process`, `network`, `evidence`, `recommendation`,
-`fingerprint`, plus `host_trust`, `private_ip`, `run_id` and `audit_version`.
-`status` is one of `FINDING_NEW`, `FINDING_RECURRING`, `CHECK_PASS`,
-`CHECK_SKIPPED`.
+Each record carries: `timestamp`, `hostname`, `module`, `severity`,
+`confidence`, `status`, `finding`, `path`, `process`, `network`, `evidence`,
+`reasons[]`, `file_sha256`, `recommendation`, `fingerprint`, plus `host_trust`,
+`private_ip`, `run_id` and `audit_version`. `status` is one of `FINDING_NEW`,
+`FINDING_RECURRING`, `CHECK_PASS`, `CHECK_SKIPPED`, `CHECK_NOT_APPLICABLE`.
 
 Logs are rotated weekly and kept for a year (`/etc/logrotate.d/itm-security`).
 They are evidence: `uninstall.sh` does not delete them.
@@ -232,8 +358,13 @@ chat ID. Every evidence string passes through a redactor first (bot tokens,
 key material are never read at all.
 
 Alerts are deduplicated by finding fingerprint, so a standing finding does not
-alert every night, and are capped per run (`TELEGRAM_MAX_ALERTS`), with a roll-up
-message sent only when there is something new alongside it.
+alert every three hours, and are capped per run (`TELEGRAM_MAX_ALERTS`), with a
+roll-up message sent only when there is something new alongside it.
+
+The fingerprint includes the file's SHA256, so a **modified** malicious file
+always re-alerts, and a finding whose **severity increases** bypasses the dedup
+window. Alert content is metadata only: path, hash, indicator names, score — file
+contents are never sent.
 
 ```text
 🚨 CRITICAL - POST-COMPROMISE AUDIT
@@ -250,14 +381,22 @@ Ref        : 8f2c1a9e5b7d3c04
 
 ### Scheduling
 
-`itm-security-audit.timer` runs the audit nightly at 03:15 with a 30 minute
-random spread, at idle IO and CPU priority. Install without it using
-`INSTALL_AUDIT_TIMER=0 bash install.sh`.
+| Unit | Schedule | Scope |
+|---|---|---|
+| `itm-security-audit.timer` | nightly 03:15 (+30 min spread) | full system audit |
+| `itm-web-scan.timer` | 00,03,06,09,12,15,18,21 (+10 min spread) | web content reconciliation |
+| `itm-web-realtime.service` | continuous | inotify, alerts within seconds |
+
+All three run at idle IO/CPU priority and are `Persistent=true`, so a scan missed
+because the server was down runs once it is back up.
 
 ```bash
-systemctl list-timers itm-security-audit.timer
+systemctl list-timers itm-security-audit.timer itm-web-scan.timer
+systemctl status itm-web-realtime --no-pager
 journalctl -u itm-security-audit.service -n 50 --no-pager
 ```
+
+Install without the schedulers: `INSTALL_AUDIT_TIMER=0 INSTALL_WEB_MONITOR=0 bash install.sh`
 
 ### Configuration
 

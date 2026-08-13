@@ -1,0 +1,63 @@
+# ============================================================
+# ITM Server Security Monitor
+# Gambling / judi slot injection keywords
+#
+# Installed to /etc/security-monitor/ioc/gambling-keywords.conf
+#
+# Format:  pattern            (POSIX extended regex, case insensitive)
+#      or: pattern|weight     (weight currently informational)
+#
+# IMPORTANT
+#
+# A single match from this list is NOT a finding. The gambling
+# module scores keyword DENSITY together with file provenance
+# (who owns the file, when it was written, whether it sits in an
+# upload directory) and corroborating indicators (hidden markup,
+# link farms, redirects, obfuscated JavaScript).
+#
+# One term in a legitimate news article scores LOW/INFO and is
+# not reported. Eight terms in a file written by www-data three
+# hours ago scores CRITICAL.
+#
+# Tune here rather than in the module. Use word boundaries (\b)
+# for short or ambiguous terms so ordinary Indonesian text does
+# not match: "data" and "deposit" appear in real government
+# content.
+# ============================================================
+
+# --- core slot vocabulary ---
+\bslot[[:space:]]*(gacor|online|terbaru|hoki|maxwin)\b
+\bgacor\b
+\bmaxwin\b
+\bscatter[[:space:]]*(hitam|emas|biru)?\b
+\bmahjong[[:space:]]*(ways|wins)?\b
+\brtp[[:space:]]*(live|slot|gacor)\b
+\bpola[[:space:]]*(slot|gacor)\b
+\bzeus[[:space:]]*(slot|gacor)\b
+\bolympus\b
+
+# --- casino / betting ---
+\bcasino\b
+\bjudi[[:space:]]*(online|bola|slot)?\b
+\btogel\b
+\btaruhan\b
+\bsportsbook\b
+\bsbobet\b
+\bpoker[[:space:]]*(online|idn)\b
+\bbandar[[:space:]]*(bola|togel|judi)\b
+\btotobet\b
+\bparlay\b
+
+# --- promotion language ---
+\bbonus[[:space:]]*new[[:space:]]*member\b
+\bfreebet\b
+\bfreespin\b
+\bjackpot[[:space:]]*(terbesar|hari[[:space:]]*ini)?\b
+\bwithdraw[[:space:]]*(cepat|tercepat)\b
+\bdeposit[[:space:]]*(pulsa|dana|ovo|gopay|tanpa[[:space:]]*potongan|minimal)\b
+\bsitus[[:space:]]*(slot|judi|togel)\b
+\blink[[:space:]]*alternatif\b
+\bagen[[:space:]]*(slot|judi|bola)\b
+\bdaftar[[:space:]]*(slot|judi)\b
+\bgampang[[:space:]]*menang\b
+\banti[[:space:]]*rungkad\b

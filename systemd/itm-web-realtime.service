@@ -1,0 +1,31 @@
+[Unit]
+Description=ITM Realtime Web Filesystem Monitor (inotify)
+Documentation=https://github.com/YOUR-ORG/itm-server-security-monitor
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Exits 0 immediately on hosts with no web application
+# workload, which is the correct behaviour rather than a
+# failure - hence RemainAfterExit and the restart policy below.
+ExecStart=/usr/local/sbin/itm-web-realtime
+
+User=root
+Group=root
+
+# on-failure, not always: a clean exit means "not applicable to
+# this host" and must not become a restart loop.
+Restart=on-failure
+RestartSec=30
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+NoNewPrivileges=true
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,54 @@
+# ============================================================
+# ITM Server Security Monitor
+# Webshell signatures
+#
+# Installed to /etc/security-monitor/ioc/webshell-patterns.conf
+#
+# Format:  pattern|weight    (POSIX extended regex, case insensitive)
+#          default weight 40
+#
+# These are NAMED SHELL FAMILIES and high confidence markers.
+# Structural detection (eval of decoded input, command execution
+# on request parameters, dynamic invocation, obfuscation) is
+# built into the module and does not belong here, because it
+# needs multi-pattern logic rather than a single regex.
+#
+# Weight guidance:
+#   50+  unambiguous, a match alone should reach HIGH
+#   30   strong, needs one corroborating indicator
+#   15   weak on its own
+# ============================================================
+
+# --- known shell families ---
+FilesMan|55
+b374k|55
+c99shell|55
+r57shell|55
+wso_version|55
+WSO[[:space:]]*[0-9]\.[0-9]|50
+IndoXploit|55
+AnonymousFox|55
+Mini[[:space:]]*Shell|45
+IndoSec|45
+Gecko[[:space:]]*Shell|45
+priv8[[:space:]]*(shell|tools)|45
+\bmarijuana[[:space:]]*shell\b|45
+
+# --- shell UI strings ---
+Command[[:space:]]*Execute|30
+\bSafe[[:space:]]*Mode[[:space:]]*Bypass\b|40
+Mass[[:space:]]*Deface|50
+Symlink[[:space:]]*Bypass|50
+\bcgi[[:space:]]*shell\b|40
+adminer\.php.{0,40}version|15
+
+# --- password gated shells ---
+\$auth_pass[[:space:]]*=|45
+md5\(\$_(POST|GET)\[[^]]*\]\)[[:space:]]*==[[:space:]]*["'][a-f0-9]{32}["']|50
+
+# --- backdoor primitives with no legitimate use in web content ---
+\bpreg_replace[[:space:]]*\([^,]*/e["'][[:space:]]*,|50
+\bassert[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)|55
+\$\{[[:space:]]*\$_(GET|POST|REQUEST)|45
+\bpcntl_exec[[:space:]]*\(|40
+\bini_set[[:space:]]*\([[:space:]]*["']disable_functions|50

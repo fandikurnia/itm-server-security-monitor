@@ -398,6 +398,8 @@ run_audit_web() {
 
     module_begin "web" "Web Filesystem"
 
+    require_web_workload "Web filesystem audit" || { module_end; return 0; }
+
     web_collect_roots
 
     if (( ${#WEB_ROOT_LIST[@]} == 0 )); then

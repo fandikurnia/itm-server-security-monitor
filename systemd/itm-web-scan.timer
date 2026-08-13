@@ -1,0 +1,22 @@
+[Unit]
+Description=ITM web content scan every 3 hours
+Documentation=https://github.com/YOUR-ORG/itm-server-security-monitor
+
+[Timer]
+# Every three hours around the clock. The scheduled scan is the
+# reconciliation layer: itm-web-realtime.service is what catches
+# a file that exists for only a few minutes.
+OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00
+
+# Spread across a fleet so Telegram does not receive every
+# server's findings in the same second.
+RandomizedDelaySec=600
+
+# A scan missed because the server was down runs once it is
+# back up, instead of being skipped silently.
+Persistent=true
+
+Unit=itm-web-scan.service
+
+[Install]
+WantedBy=timers.target

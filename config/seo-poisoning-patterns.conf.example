@@ -1,0 +1,45 @@
+# ============================================================
+# ITM Server Security Monitor
+# SEO poisoning patterns
+#
+# Installed to /etc/security-monitor/ioc/seo-poisoning-patterns.conf
+#
+# Additional vocabulary checked in page metadata (<title>,
+# <meta description>, <meta keywords>) and link text.
+#
+# Cloaking detection, canonical/base hijacking, hidden links and
+# doorway page bursts are structural and live in the module.
+# This file carries the vocabulary that indicates WHAT the site
+# was poisoned for.
+#
+# The Japanese keyword hack is detected by script range (CJK
+# text appearing in metadata of a non-CJK site), not by word
+# list, so it needs no entries here.
+# ============================================================
+
+# --- pharmacy spam ---
+\bviagra\b
+\bcialis\b
+\blevitra\b
+\btramadol\b
+\bxanax\b
+\boxycodone\b
+\bpharmacy[[:space:]]*online\b
+
+# --- adult spam ---
+\bporn\b
+\bxxx[[:space:]]*video\b
+\bescort[[:space:]]*service\b
+
+# --- financial / fraud spam ---
+\bpayday[[:space:]]*loan\b
+\bforex[[:space:]]*trading[[:space:]]*bonus\b
+\bbinary[[:space:]]*option\b
+\bcrypto[[:space:]]*(doubler|giveaway)\b
+
+# --- counterfeit / piracy ---
+\breplica[[:space:]]*(watch|bag)\b
+\bcheap[[:space:]]*(jersey|nfl)\b
+\bessay[[:space:]]*writing[[:space:]]*service\b
+\bfree[[:space:]]*download[[:space:]]*crack\b
+\bnulled[[:space:]]*(script|theme)\b

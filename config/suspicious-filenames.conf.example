@@ -1,0 +1,65 @@
+# ============================================================
+# ITM Server Security Monitor
+# Suspicious web filenames
+#
+# Installed to /etc/security-monitor/ioc/suspicious-filenames.conf
+#
+# Format:  glob|weight     (shell glob against the BASENAME)
+#          default weight 20
+#
+# IMPORTANT
+#
+# A filename is never sufficient on its own, and this list is
+# scored, not matched. adminer.php is a real database tool that
+# people legitimately install; upload.php is a normal part of
+# many applications. A name from this list contributes points,
+# and the file still has to earn the rest of its score from its
+# content, location, owner and age.
+#
+# Weight guidance:
+#   35  no legitimate use in a document root
+#   20  suspicious in context
+#   10  common enough that it needs strong corroboration
+# ============================================================
+
+# --- classic shell names ---
+shell.php|35
+shel.php|35
+cmd.php|35
+c99.php|35
+r57.php|35
+wso.php|35
+b374k.php|35
+mini.php|30
+alfa.php|35
+gecko.php|30
+indoxploit.php|35
+by*.php|25
+0wn*.php|30
+
+# --- disguised as infrastructure ---
+wp-conf*.php|25
+wp-config-old.php|30
+wp-admin.php|25
+config.bak.php|30
+.well-known/*.php|30
+
+# --- generic short names in a web root ---
+# Single character and 1-2 digit names are almost never part of
+# a real application.
+?.php|25
+??.php|15
+[0-9].php|30
+[0-9][0-9].php|25
+
+# --- tools that are legitimate but high value if unexpected ---
+adminer.php|10
+adminer-*.php|10
+phpmyadmin.php|15
+filemanager.php|20
+upload.php|10
+uploader.php|20
+file.php|15
+info.php|15
+phpinfo.php|20
+test.php|10

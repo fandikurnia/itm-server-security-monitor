@@ -62,6 +62,11 @@ ITM_DRY_RUN="${ITM_DRY_RUN:-0}"      # do not write log/json/state, do not alert
 ITM_TELEGRAM="${ITM_TELEGRAM:-0}"    # dispatch Telegram alerts
 ITM_WRITE_LOG=1
 
+# Standalone mode is used by the realtime FIM daemon: findings
+# are written and alerted one at a time as events arrive,
+# instead of being buffered for an end-of-run summary.
+ITM_STANDALONE="${ITM_STANDALONE:-0}"
+
 # ============================================================
 # DEFAULT POLICY
 #
@@ -104,8 +109,8 @@ OUTBOUND_ALLOW_PROCS="sshd apt apt-get aptd unattended-upgr packagekitd dnf yum 
 # ITM's own integrations. Listed explicitly so the allowlist is
 # itself auditable, and printed in the report.
 PAM_EXEC_ALLOW="/usr/local/sbin/ssh-login-alert"
-ITM_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-security-audit.service itm-security-audit.timer"
-ITM_OWN_BINARIES="/usr/local/sbin/security-notify /usr/local/sbin/ssh-login-alert /usr/local/sbin/security-file-monitor /usr/local/sbin/itm-command-relay /usr/local/sbin/itm-security"
+ITM_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-security-audit.service itm-security-audit.timer itm-web-scan.service itm-web-scan.timer itm-web-realtime.service"
+ITM_OWN_BINARIES="/usr/local/sbin/security-notify /usr/local/sbin/ssh-login-alert /usr/local/sbin/security-file-monitor /usr/local/sbin/itm-command-relay /usr/local/sbin/itm-security /usr/local/sbin/itm-web-realtime"
 
 # Units seen in real incidents on this estate.
 KNOWN_BAD_UNITS="defaults.service server-security.service"
@@ -816,6 +821,23 @@ ip_is_trusted() {
 # JSON
 # ============================================================
 
+# Newline separated reasons -> JSON array elements.
+json_reason_array() {
+
+    local text="$1" line first=1 out=""
+
+    [[ -n "$text" ]] || { printf ''; return 0; }
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        (( first )) || out+=","
+        out+="\"$(json_escape "$line")\""
+        first=0
+    done <<< "$text"
+
+    printf '%s' "$out"
+}
+
 json_escape() {
     local text="$1"
     text="${text//\\/\\\\}"
@@ -846,7 +868,7 @@ declare -A MODULE_COUNT=()
 declare -A SEV_COUNT=()
 ITM_MODULE_ORDER=()
 
-TG_SEV=(); TG_TITLE=(); TG_PATH=(); TG_EVIDENCE=(); TG_ACTION=(); TG_FP=(); TG_MODULE=()
+TG_SEV=(); TG_TITLE=(); TG_PATH=(); TG_EVIDENCE=(); TG_ACTION=(); TG_FP=(); TG_MODULE=(); TG_CONF=()
 
 ITM_MAX_SEV="NONE"
 ITM_FINDING_TOTAL=0
@@ -930,19 +952,35 @@ add_finding() {
     local finding="$1"; shift
 
     local id="" path="" process="" network="" evidence="" action="" status=""
+    local confidence="" reasons="" filehash=""
     local kv
 
     for kv in "$@"; do
         case "$kv" in
-            id=*)       id="${kv#id=}" ;;
-            path=*)     path="${kv#path=}" ;;
-            process=*)  process="${kv#process=}" ;;
-            network=*)  network="${kv#network=}" ;;
-            evidence=*) evidence="${kv#evidence=}" ;;
-            action=*)   action="${kv#action=}" ;;
-            status=*)   status="${kv#status=}" ;;
+            id=*)         id="${kv#id=}" ;;
+            path=*)       path="${kv#path=}" ;;
+            process=*)    process="${kv#process=}" ;;
+            network=*)    network="${kv#network=}" ;;
+            evidence=*)   evidence="${kv#evidence=}" ;;
+            action=*)     action="${kv#action=}" ;;
+            status=*)     status="${kv#status=}" ;;
+            confidence=*) confidence="${kv#confidence=}" ;;
+            reasons=*)    reasons="${kv#reasons=}" ;;
+            hash=*)       filehash="${kv#hash=}" ;;
         esac
     done
+
+    # A finding without an explicit confidence gets one derived
+    # from its severity, so every record carries the field.
+    if [[ -z "$confidence" ]]; then
+        case "$severity" in
+            CRITICAL) confidence=90 ;;
+            HIGH)     confidence=75 ;;
+            MEDIUM)   confidence=60 ;;
+            LOW)      confidence=45 ;;
+            *)        confidence=100 ;;
+        esac
+    fi
 
     # Redact before anything is persisted or transmitted.
     finding="$(redact "$finding")"
@@ -951,10 +989,15 @@ add_finding() {
     network="$(truncate_text "$(redact "$network")" 600)"
     evidence="$(truncate_text "$(redact "$evidence")" 1200)"
 
+    # Fingerprint = host + module + finding identity + path +
+    # file hash. Including the file hash means a modified
+    # malicious file produces a NEW fingerprint and therefore a
+    # fresh alert, while an unchanged standing finding stays
+    # deduplicated.
     local fp_source="${id:-$finding}"
     local fingerprint
-    fingerprint="$(printf '%s|%s|%s|%s' \
-        "$ITM_HOSTNAME" "$CURRENT_MODULE" "$fp_source" "$path" \
+    fingerprint="$(printf '%s|%s|%s|%s|%s' \
+        "$ITM_HOSTNAME" "$CURRENT_MODULE" "$fp_source" "$path" "$filehash" \
         | sha256sum 2>/dev/null | cut -c1-32)"
     [[ -n "$fingerprint" ]] || fingerprint="0000000000000000"
 
@@ -994,12 +1037,28 @@ add_finding() {
 
     # Human readable output.
     if (( ITM_QUIET == 0 )); then
-        printf '%s[%-8s]%s %s\n' "$(sev_color "$severity")" "$severity" "$C_RESET" "$finding"
+        if (( snum >= 2 )); then
+            printf '%s[%-8s]%s %s %s(confidence %s%%)%s\n' \
+                "$(sev_color "$severity")" "$severity" "$C_RESET" "$finding" \
+                "$C_DIM" "$confidence" "$C_RESET"
+        else
+            printf '%s[%-8s]%s %s\n' "$(sev_color "$severity")" "$severity" "$C_RESET" "$finding"
+        fi
         [[ -n "$path" ]]     && printf '           %spath    :%s %s\n' "$C_DIM" "$C_RESET" "$path"
         [[ -n "$process" ]]  && printf '           %sprocess :%s %s\n' "$C_DIM" "$C_RESET" "${process%%$'\n'*}"
         [[ -n "$network" ]]  && printf '           %snetwork :%s %s\n' "$C_DIM" "$C_RESET" "${network%%$'\n'*}"
         if [[ -n "$evidence" && $snum -ge 2 ]]; then
             printf '           %sevidence:%s %s\n' "$C_DIM" "$C_RESET" "${evidence%%$'\n'*}"
+        fi
+        if [[ -n "$reasons" && $snum -ge 2 ]]; then
+            printf '           %sreasons :%s\n' "$C_DIM" "$C_RESET"
+            local reason_line reason_shown=0
+            while IFS= read -r reason_line; do
+                [[ -n "$reason_line" ]] || continue
+                (( reason_shown >= 8 )) && break
+                printf '                     - %s\n' "$reason_line"
+                reason_shown=$(( reason_shown + 1 ))
+            done <<< "$reasons"
         fi
         [[ -n "$action" && $snum -ge 3 ]] && printf '           %saction  :%s %s\n' "$C_DIM" "$C_RESET" "$action"
     fi
@@ -1011,27 +1070,49 @@ add_finding() {
     local ts
     ts="$(date '+%Y-%m-%dT%H:%M:%S%:z')"
 
-    printf '{"timestamp":"%s","hostname":"%s","module":"%s","severity":"%s","status":"%s","finding":"%s","path":"%s","process":"%s","network":"%s","evidence":"%s","recommendation":"%s","fingerprint":"%s","host_trust":"%s","private_ip":"%s","run_id":"%s","audit_version":"%s"}\n' \
+    local json_record
+    printf -v json_record \
+        '{"timestamp":"%s","hostname":"%s","module":"%s","severity":"%s","confidence":%s,"status":"%s","finding":"%s","path":"%s","process":"%s","network":"%s","evidence":"%s","reasons":[%s],"file_sha256":"%s","recommendation":"%s","fingerprint":"%s","host_trust":"%s","private_ip":"%s","run_id":"%s","audit_version":"%s"}' \
         "$ts" \
         "$(json_escape "$ITM_HOSTNAME")" \
         "$(json_escape "$CURRENT_MODULE")" \
         "$severity" \
+        "$confidence" \
         "$status" \
         "$(json_escape "$finding")" \
         "$(json_escape "$path")" \
         "$(json_escape "$process")" \
         "$(json_escape "$network")" \
         "$(json_escape "$evidence")" \
+        "$(json_reason_array "$reasons")" \
+        "$(json_escape "$filehash")" \
         "$(json_escape "$action")" \
         "$fingerprint" \
         "$(json_escape "$HOST_TRUST_STATUS")" \
         "$(json_escape "$ITM_PRIVATE_IP")" \
         "$ITM_RUN_ID" \
-        "$ITM_AUDIT_VERSION" \
-        >> "$ITM_RUN_TMP/findings.jsonl"
+        "$ITM_AUDIT_VERSION"
+
+    if (( ITM_STANDALONE )); then
+        # Realtime daemon: no run buffer exists, so the record
+        # goes straight to the append-only JSONL file.
+        (( ITM_WRITE_LOG )) && printf '%s\n' "$json_record" >> "$ITM_JSON_FILE" 2>/dev/null
+    else
+        printf '%s\n' "$json_record" >> "$ITM_RUN_TMP/findings.jsonl"
+    fi
 
     # Telegram queue.
     if (( ITM_TELEGRAM )) && (( snum >= $(sev_num "$TELEGRAM_MIN_SEVERITY") )); then
+
+        if (( ITM_STANDALONE )); then
+            # Realtime: an alert that waits for the end of a run
+            # is not a realtime alert.
+            telegram_send_finding \
+                "$severity" "${MODULE_LABEL[$CURRENT_MODULE]:-$CURRENT_MODULE}" \
+                "$finding" "$path" "$evidence" "$action" "$fingerprint" "$confidence"
+            return 0
+        fi
+
         TG_SEV+=("$severity")
         TG_TITLE+=("$finding")
         TG_PATH+=("$path")
@@ -1039,6 +1120,7 @@ add_finding() {
         TG_ACTION+=("$action")
         TG_FP+=("$fingerprint")
         TG_MODULE+=("${MODULE_LABEL[$CURRENT_MODULE]:-$CURRENT_MODULE}")
+        TG_CONF+=("$confidence")
     fi
 }
 
@@ -1049,6 +1131,157 @@ add_pass() {
 
 add_skip() {
     add_finding INFO "$1" status=CHECK_SKIPPED "${@:2}"
+}
+
+# ------------------------------------------------------------
+# NOT APPLICABLE
+#
+# A module that does not apply to this host's role is neither a
+# pass nor a failure. Reporting "PASS" for a webshell scan on a
+# database server is a lie of omission: nothing was examined.
+# ------------------------------------------------------------
+
+add_na() {
+    add_finding INFO "$1" status=CHECK_NOT_APPLICABLE "${@:2}"
+    # Only mark the module NA if nothing real was found in it.
+    # add_finding has just raised the module severity to INFO, so
+    # both NONE and INFO mean "nothing was detected here".
+    case "${MODULE_MAX_SEV[$CURRENT_MODULE]:-NONE}" in
+        NONE|INFO) MODULE_MAX_SEV["$CURRENT_MODULE"]="NA" ;;
+    esac
+}
+
+# ============================================================
+# SCORING ENGINE
+#
+# Single indicators do not make a detection. "eval(" appears in
+# legitimate frameworks; the word "bonus" appears in legitimate
+# articles. Every content based finding accumulates weighted
+# reasons and derives its severity and confidence from the
+# total, so the report can always answer "why".
+#
+#   score_reset
+#   score_add <points> "<reason>"
+#   score_severity   -> CRITICAL|HIGH|MEDIUM|LOW|INFO
+#   score_confidence -> 0-99
+#   $SCORE_REASONS   -> newline separated reasons
+# ============================================================
+
+SCORE_TOTAL=0
+SCORE_REASONS=""
+
+SCORE_THRESHOLD_CRITICAL="${SCORE_THRESHOLD_CRITICAL:-80}"
+SCORE_THRESHOLD_HIGH="${SCORE_THRESHOLD_HIGH:-55}"
+SCORE_THRESHOLD_MEDIUM="${SCORE_THRESHOLD_MEDIUM:-30}"
+SCORE_THRESHOLD_LOW="${SCORE_THRESHOLD_LOW:-12}"
+
+score_reset() {
+    SCORE_TOTAL=0
+    SCORE_REASONS=""
+}
+
+score_add() {
+    local points="$1" reason="$2"
+    [[ "$points" =~ ^-?[0-9]+$ ]] || return 0
+    SCORE_TOTAL=$(( SCORE_TOTAL + points ))
+    SCORE_REASONS+="${reason} (+${points})
+"
+}
+
+score_severity() {
+    if   (( SCORE_TOTAL >= SCORE_THRESHOLD_CRITICAL )); then printf 'CRITICAL'
+    elif (( SCORE_TOTAL >= SCORE_THRESHOLD_HIGH ));     then printf 'HIGH'
+    elif (( SCORE_TOTAL >= SCORE_THRESHOLD_MEDIUM ));   then printf 'MEDIUM'
+    elif (( SCORE_TOTAL >= SCORE_THRESHOLD_LOW ));      then printf 'LOW'
+    else printf 'INFO'
+    fi
+}
+
+score_confidence() {
+    local c="$SCORE_TOTAL"
+    (( c > 99 )) && c=99
+    (( c < 1 ))  && c=1
+    printf '%s' "$c"
+}
+
+# ============================================================
+# IOC LISTS
+#
+# Loaded from /etc/security-monitor/ioc/*.conf so patterns can
+# be tuned without editing a single line of shell.
+#
+# Format: one entry per line, "#" comments, blank lines ignored.
+# Optional weight: "keyword|weight"
+# ============================================================
+
+ITM_IOC_DIR="${ITM_IOC_DIR:-$ITM_CONF_DIR/ioc}"
+
+# load_ioc_list <file> <array-name>
+# Falls back to the repository copy when not installed.
+load_ioc_list() {
+
+    local name="$1" __arrayname="$2"
+    local file="$ITM_IOC_DIR/$name"
+    local line
+
+    # shellcheck disable=SC2178
+    eval "$__arrayname=()"
+
+    if [[ ! -r "$file" ]]; then
+        [[ -r "$ITM_LIB_DIR/ioc/$name" ]] && file="$ITM_LIB_DIR/ioc/$name" || return 1
+    fi
+
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        eval "$__arrayname+=(\"\$line\")"
+    done < "$file"
+
+    return 0
+}
+
+# "pattern|30" -> pattern / weight
+#
+# The weight is parsed from the RIGHT and only when it is purely
+# numeric. Splitting on the first "|" would corrupt every
+# pattern containing a regex alternation:
+#
+#   \bslot[[:space:]]*(gacor|online)\b|35
+#
+# must yield the whole regex plus 35, not "\bslot...(gacor".
+ioc_entry_value() {
+    local entry="$1" tail="${1##*|}"
+    if [[ "$tail" =~ ^[0-9]+$ && "$tail" != "$entry" ]]; then
+        printf '%s' "${entry%|*}"
+    else
+        printf '%s' "$entry"
+    fi
+}
+
+ioc_entry_weight() {
+    local tail="${1##*|}"
+    if [[ "$tail" =~ ^[0-9]+$ && "$tail" != "$1" ]]; then
+        printf '%s' "$tail"
+    else
+        printf '%s' "$2"
+    fi
+}
+
+# Build an alternation regex from an IOC array, for a single
+# grep pass instead of one pass per keyword.
+ioc_build_regex() {
+    local -n __list="$1"
+    local entry first=1 out=""
+    for entry in ${__list[@]+"${__list[@]}"}; do
+        entry="$(ioc_entry_value "$entry")"
+        [[ -n "$entry" ]] || continue
+        (( first )) || out+="|"
+        out+="$entry"
+        first=0
+    done
+    printf '%s' "$out"
 }
 
 # ============================================================
@@ -1068,6 +1301,9 @@ record_seen() {
     local fp="$1"
     (( ITM_DRY_RUN )) && return 0
     [[ -d "$ITM_STATE_DIR" ]] || return 0
+    # The realtime daemon has no run buffer: it alerts per event
+    # and keeps its state in the alert database instead.
+    [[ -n "$ITM_RUN_TMP" && -d "$ITM_RUN_TMP" ]] || return 0
     printf '%s %s\n' "$fp" "$(date +%s)" >> "$ITM_RUN_TMP/seen.new" 2>/dev/null || true
 }
 
@@ -1100,27 +1336,41 @@ commit_seen_state() {
 # the credentials. This library never reads telegram.conf.
 # ============================================================
 
+# alert_allowed <fingerprint> [severity]
+#
+# Re-alerting rules:
+#   - never within ALERT_REPEAT_HOURS for an identical finding
+#   - always when the severity of a known finding increases
+#
+# A changed file produces a different fingerprint (the file hash
+# is part of it), so file modification always re-alerts.
 alert_allowed() {
 
-    local fp="$1" now last window
+    local fp="$1" severity="${2:-}" now last last_sev window
 
     now="$(date +%s)"
     window=$(( ALERT_REPEAT_HOURS * 3600 ))
 
     [[ -r "$ITM_ALERT_DB" ]] || return 0
 
-    last="$(awk -v f="$fp" '$1 == f { print $2 }' "$ITM_ALERT_DB" 2>/dev/null | tail -1)"
-    [[ -n "$last" ]] || return 0
+    read -r last last_sev < <(awk -v f="$fp" '$1 == f { print $2, $3 }' "$ITM_ALERT_DB" 2>/dev/null | tail -1)
+
+    [[ -n "${last:-}" ]] || return 0
     [[ "$last" =~ ^[0-9]+$ ]] || return 0
+
+    # Escalation always gets through the dedup window.
+    if [[ -n "$severity" && "${last_sev:-0}" =~ ^[0-9]+$ ]]; then
+        (( $(sev_num "$severity") > last_sev )) && return 0
+    fi
 
     (( now - last >= window ))
 }
 
 alert_record() {
-    local fp="$1"
+    local fp="$1" severity="${2:-INFO}"
     (( ITM_DRY_RUN )) && return 0
     [[ -d "$ITM_STATE_DIR" ]] || return 0
-    printf '%s %s\n' "$fp" "$(date +%s)" >> "$ITM_ALERT_DB" 2>/dev/null || true
+    printf '%s %s %s\n' "$fp" "$(date +%s)" "$(sev_num "$severity")" >> "$ITM_ALERT_DB" 2>/dev/null || true
     chmod 600 "$ITM_ALERT_DB" 2>/dev/null || true
 }
 
@@ -1157,6 +1407,59 @@ telegram_send() {
     }
 }
 
+# ------------------------------------------------------------
+# One finding -> one message.
+#
+# Shared by the batch dispatcher and the realtime daemon so
+# both produce an identical alert format.
+#
+# Never sends file contents: only metadata, matched indicator
+# names and a hash. Everything has already passed through
+# redact().
+# ------------------------------------------------------------
+
+telegram_send_finding() {
+
+    local severity="$1" module="$2" finding="$3" path="$4"
+    local evidence="$5" action="$6" fingerprint="$7" confidence="${8:-}"
+
+    alert_allowed "$fingerprint" "$severity" || return 1
+
+    local message
+    message="$(sev_icon "$severity") ${severity} - $(printf '%s' "${module}" | tr '[:lower:]' '[:upper:]')
+
+Server   : ${ITM_HOSTNAME}
+Time     : $(date '+%Y-%m-%d %H:%M:%S %Z')
+Finding  : ${finding}"
+
+    [[ -n "$confidence" ]] && message+="
+Confidence: ${confidence}%"
+
+    [[ -n "$path" ]] && message+="
+Path     : ${path}"
+
+    [[ -n "$evidence" ]] && message+="
+
+Indicators:
+$(truncate_text "$evidence" 500)"
+
+    [[ -n "$action" ]] && message+="
+
+Action   : ${action}"
+
+    message+="
+
+Host trust : ${HOST_TRUST_STATUS}
+Ref        : ${fingerprint}"
+
+    if telegram_send "$message"; then
+        alert_record "$fingerprint" "$severity"
+        return 0
+    fi
+
+    return 1
+}
+
 telegram_dispatch() {
 
     (( ITM_TELEGRAM )) || return 0
@@ -1164,45 +1467,22 @@ telegram_dispatch() {
     local total="${#TG_SEV[@]}"
     (( total > 0 )) || return 0
 
-    local sent=0 suppressed=0 i message
+    local sent=0 suppressed=0 i
 
     for (( i = 0; i < total; i++ )); do
-
-        if ! alert_allowed "${TG_FP[$i]}"; then
-            suppressed=$(( suppressed + 1 ))
-            continue
-        fi
 
         if (( sent >= TELEGRAM_MAX_ALERTS )); then
             suppressed=$(( suppressed + 1 ))
             continue
         fi
 
-        message="$(sev_icon "${TG_SEV[$i]}") ${TG_SEV[$i]} - POST-COMPROMISE AUDIT
-
-Module   : ${TG_MODULE[$i]}
-Finding  : ${TG_TITLE[$i]}"
-
-        [[ -n "${TG_PATH[$i]}" ]] && message+="
-Path     : ${TG_PATH[$i]}"
-
-        [[ -n "${TG_EVIDENCE[$i]}" ]] && message+="
-
-Evidence :
-$(truncate_text "${TG_EVIDENCE[$i]}" 500)"
-
-        [[ -n "${TG_ACTION[$i]}" ]] && message+="
-
-Action   : ${TG_ACTION[$i]}"
-
-        message+="
-
-Host trust : ${HOST_TRUST_STATUS}
-Ref        : ${TG_FP[$i]}"
-
-        if telegram_send "$message"; then
-            alert_record "${TG_FP[$i]}"
+        if telegram_send_finding \
+            "${TG_SEV[$i]}" "${TG_MODULE[$i]}" "${TG_TITLE[$i]}" "${TG_PATH[$i]}" \
+            "${TG_EVIDENCE[$i]}" "${TG_ACTION[$i]}" "${TG_FP[$i]}" "${TG_CONF[$i]:-}"
+        then
             sent=$(( sent + 1 ))
+        else
+            suppressed=$(( suppressed + 1 ))
         fi
     done
 
@@ -1224,6 +1504,127 @@ Host trust : ${HOST_TRUST_STATUS}"
     fi
 
     prune_alert_db
+}
+
+# ============================================================
+# EVIDENCE SNAPSHOT
+#
+# Read only. Files are copied, never moved, renamed, quarantined
+# or deleted: the live file has to stay exactly where the
+# attacker left it until an operator decides otherwise.
+# ============================================================
+
+ITM_EVIDENCE_DIR="${ITM_EVIDENCE_DIR:-/var/lib/itm-security/evidence}"
+EVIDENCE_COPY="${EVIDENCE_COPY:-1}"
+EVIDENCE_MAX_BYTES="${EVIDENCE_MAX_BYTES:-1048576}"
+
+# evidence_snapshot <path> <fingerprint> [context]
+evidence_snapshot() {
+
+    local path="$1" fingerprint="$2" context="${3:-}"
+    local day dir size base
+
+    (( EVIDENCE_COPY )) || return 0
+    (( ITM_DRY_RUN ))   && return 0
+    [[ -f "$path" ]]    || return 0
+    is_root             || return 0
+
+    day="$(date '+%Y%m%d')"
+    dir="$ITM_EVIDENCE_DIR/$day"
+
+    mkdir -p "$dir" 2>/dev/null || return 0
+    chmod 700 "$ITM_EVIDENCE_DIR" "$dir" 2>/dev/null || true
+
+    base="${path##*/}"
+    base="${base//[^A-Za-z0-9._-]/_}"
+
+    # Metadata is always recorded, even when the file itself is
+    # too large to copy.
+    {
+        printf 'path        : %s\n' "$path"
+        printf 'collected   : %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+        printf 'fingerprint : %s\n' "$fingerprint"
+        printf 'sha256      : %s\n' "$(file_sha256 "$path")"
+        printf 'stat        : %s\n' "$(stat -c 'mode=%a owner=%U:%G size=%s mtime=%y ctime=%z inode=%i links=%h' "$path" 2>/dev/null)"
+        [[ -n "$context" ]] && printf 'context     :\n%s\n' "$context"
+    } > "$dir/${fingerprint}_${base}.meta" 2>/dev/null || return 0
+
+    size="$(stat -c '%s' "$path" 2>/dev/null || echo 0)"
+    if [[ "$size" =~ ^[0-9]+$ ]] && (( size <= EVIDENCE_MAX_BYTES )); then
+        cp -p "$path" "$dir/${fingerprint}_${base}" 2>/dev/null || true
+        chmod 600 "$dir/${fingerprint}_${base}" 2>/dev/null || true
+    fi
+
+    chmod 600 "$dir/${fingerprint}_${base}.meta" 2>/dev/null || true
+
+    printf '%s' "$dir/${fingerprint}_${base}"
+}
+
+# ============================================================
+# INCREMENTAL SCAN STATE
+#
+# Records when each scan target was last examined, so a routine
+# run only has to look at what changed. A full reconciliation
+# pass still runs periodically.
+# ============================================================
+
+ITM_SCAN_STATE_DIR="${ITM_SCAN_STATE_DIR:-/var/lib/itm-security/scan-state}"
+
+scan_state_key() {
+    printf '%s' "$1" | sha256sum 2>/dev/null | cut -c1-16
+}
+
+# Epoch of the last scan for a target, or 0.
+scan_state_get() {
+    local key file value
+    key="$(scan_state_key "$1")"
+    file="$ITM_SCAN_STATE_DIR/$key"
+    [[ -r "$file" ]] || { printf '0'; return 0; }
+    read -r value < "$file" 2>/dev/null
+    [[ "$value" =~ ^[0-9]+$ ]] || value=0
+    printf '%s' "$value"
+}
+
+scan_state_set() {
+    local key
+    (( ITM_DRY_RUN )) && return 0
+    mkdir -p "$ITM_SCAN_STATE_DIR" 2>/dev/null || return 0
+    chmod 700 "$ITM_SCAN_STATE_DIR" 2>/dev/null || true
+    key="$(scan_state_key "$1")"
+    printf '%s\n' "${2:-$(date +%s)}" > "$ITM_SCAN_STATE_DIR/$key" 2>/dev/null || true
+}
+
+# ============================================================
+# LOW PRIORITY EXECUTION
+#
+# This is a production web server. Scans are pushed to the back
+# of the CPU and IO queues so a security sweep never competes
+# with a page render.
+# ============================================================
+
+SCAN_NICE="${SCAN_NICE:-15}"
+SCAN_IONICE="${SCAN_IONICE:-1}"
+
+# run_scan <timeout-seconds> <command...>
+run_scan() {
+
+    local secs="$1"; shift
+    local -a prefix=()
+
+    if have_cmd nice; then
+        prefix+=(nice -n "$SCAN_NICE")
+    fi
+
+    if (( SCAN_IONICE )) && have_cmd ionice; then
+        # class 3 = idle: only uses disk time nobody else wants.
+        prefix+=(ionice -c 3)
+    fi
+
+    if have_cmd timeout; then
+        prefix+=(timeout "${secs}s")
+    fi
+
+    "${prefix[@]}" "$@" 2>/dev/null
 }
 
 # ============================================================
@@ -1280,9 +1681,63 @@ status_label() {
         MEDIUM)   echo "MEDIUM" ;;
         LOW)      echo "LOW" ;;
         INFO|NONE) echo "NO KNOWN IOC DETECTED" ;;
+        NA)       echo "NOT APPLICABLE" ;;
         SKIPPED)  echo "NOT EVALUATED" ;;
         *)        echo "UNKNOWN" ;;
     esac
+}
+
+# ------------------------------------------------------------
+# Web security status board
+#
+# Printed by "itm-security web status". Same terminology rule
+# as the main board: never CLEAN, never "SERVER CLEAN".
+# ------------------------------------------------------------
+
+web_status_board() {
+
+    (( ITM_QUIET )) && return 0
+
+    local mod label
+
+    say ""
+    say "${C_BOLD}============================================================${C_RESET}"
+    say "${C_BOLD} WEB SECURITY STATUS${C_RESET}"
+    say "${C_BOLD}============================================================${C_RESET}"
+    say ""
+    printf '%-24s : %s\n' "Host" "$ITM_HOSTNAME"
+    printf '%-24s : %s\n' "Scan time" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    printf '%-24s : %s\n' "Host role" "$(role_summary_line 2>/dev/null || echo unknown)"
+    say ""
+
+    for mod in webshell gambling seo integrity nginx php; do
+        [[ -n "${MODULE_LABEL[$mod]:-}" ]] || continue
+        label="${MODULE_LABEL[$mod]}"
+        printf '%-24s : %s%s%s\n' \
+            "$label" \
+            "$(sev_color "${MODULE_MAX_SEV[$mod]:-NONE}")" \
+            "$(status_label "${MODULE_MAX_SEV[$mod]:-NONE}")" \
+            "$C_RESET"
+    done
+
+    say ""
+    printf '%-24s : CRITICAL=%s HIGH=%s MEDIUM=%s LOW=%s\n' \
+        "Findings" \
+        "${SEV_COUNT[CRITICAL]:-0}" \
+        "${SEV_COUNT[HIGH]:-0}" \
+        "${SEV_COUNT[MEDIUM]:-0}" \
+        "${SEV_COUNT[LOW]:-0}"
+
+    printf '%-24s : %s%s%s\n' "Overall Risk" \
+        "$(sev_color "$ITM_MAX_SEV")" \
+        "$( [[ "$ITM_MAX_SEV" == "NONE" ]] && printf 'NO KNOWN WEB IOC DETECTED AT SCAN TIME' || printf '%s' "$ITM_MAX_SEV" )" \
+        "$C_RESET"
+
+    say ""
+    say "${C_DIM}A scan reports what it recognised at the time it ran. It is not a"
+    say "statement that the host is clean. Realtime monitoring covers the"
+    say "interval between scans: systemctl status itm-web-realtime${C_RESET}"
+    say "${C_BOLD}============================================================${C_RESET}"
 }
 
 audit_summary() {
