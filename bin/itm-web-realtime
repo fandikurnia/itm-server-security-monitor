@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# ITM Server Security Monitor
+# Realtime web filesystem monitor
+#
+# The scheduled audit runs every three hours. An attacker who
+# uploads x.php at 10:01 and deletes it at 10:10 is invisible to
+# a 09:00 and 12:00 scan. This daemon closes that window: it
+# watches the web directories with inotify and classifies every
+# new or modified file as it appears.
+#
+# The two layers are deliberate:
+#
+#   realtime      catches the event, may miss files during a
+#                 restart or when the watch limit is exhausted
+#   scheduled     reconciles the whole tree, catches whatever
+#                 realtime missed
+#
+# Neither is sufficient alone.
+#
+# AUDIT ONLY. This daemon reports. It never deletes, quarantines
+# or chmods a file, and it never executes one.
+#
+# Uses the same inotifywait dependency the file monitor already
+# relies on, and the same security-notify Telegram path.
+# ============================================================
+
+set -uo pipefail
+
+ITM_LIB_DIR="${ITM_LIB_DIR:-/usr/local/lib/itm-security}"
+
+if [[ ! -r "$ITM_LIB_DIR/itm-audit-common.sh" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    if [[ -r "$SCRIPT_DIR/../lib/itm-audit-common.sh" ]]; then
+        ITM_MODULE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/modules"
+        ITM_LIB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/lib"
+    else
+        echo "[ERROR] itm-audit-common.sh not found" >&2
+        exit 1
+    fi
+fi
+
+ITM_MODULE_DIR="${ITM_MODULE_DIR:-$ITM_LIB_DIR/modules}"
+
+# shellcheck source=../lib/itm-audit-common.sh
+source "$ITM_LIB_DIR/itm-audit-common.sh"
+# shellcheck source=../lib/itm-web-common.sh
+source "$ITM_LIB_DIR/itm-web-common.sh"
+
+# Findings are written and alerted one at a time, as they
+# happen, rather than buffered into a run report.
+ITM_STANDALONE=1
+ITM_TELEGRAM=1
+ITM_QUIET=1
+
+audit_load_config
+audit_detect_os
+audit_detect_host
+
+# Role gating applies here too: a host with no web application
+# has nothing for this daemon to watch.
+# shellcheck source=../modules/audit_role.sh
+source "$ITM_MODULE_DIR/audit_role.sh"
+
+CURRENT_MODULE="realtime"
+MODULE_LABEL["realtime"]="Realtime Web Monitor"
+
+log_event() {
+    printf '%s [realtime] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$*" \
+        | tee -a "$ITM_LOG_FILE" 2>/dev/null >&2
+}
+
+# ------------------------------------------------------------
+# Watch list
+#
+# Recursive watches are expensive: every subdirectory consumes
+# an inotify watch, and the kernel limit is finite. Session and
+# cache directories are excluded not only for noise but because
+# they would exhaust that limit on their own.
+# ------------------------------------------------------------
+
+REALTIME_WATCH_DIRS=()
+
+build_watch_list() {
+
+    local root dir
+
+    web_scan_roots || return 1
+
+    for root in "${WEB_SCAN_ROOTS[@]}"; do
+
+        REALTIME_WATCH_DIRS+=("$root")
+
+        # Upload directories are the highest value watches and
+        # are already enumerated by the shared helper.
+        while IFS= read -r dir; do
+            [[ -n "$dir" && -d "$dir" ]] || continue
+            REALTIME_WATCH_DIRS+=("$dir")
+        done < <(web_upload_dirs "$root")
+    done
+
+    (( ${#REALTIME_WATCH_DIRS[@]} > 0 ))
+}
+
+# inotifywait exclusion regex, built from the same exclusion
+# list the scheduled scan uses.
+build_exclude_regex() {
+    local d out=""
+    for d in $WEB_EXCLUDE_DIRS; do
+        out+="${out:+|}/${d}/"
+    done
+    (( WEB_EXCLUDE_VENDOR )) && out+="${out:+|}/vendor/"
+    # Editor and transfer artefacts.
+    out+="${out:+|}\\.(swp|swx|tmp|part|filepart)$|~$"
+    printf '%s' "$out"
+}
+
+# ------------------------------------------------------------
+# Event classification
+#
+# Fast path first: the overwhelming majority of events are
+# ordinary application writes and must cost almost nothing.
+# ------------------------------------------------------------
+
+is_code_file() {
+    local name="$1" ext
+    for ext in $WEB_CODE_EXT; do
+        [[ "$name" == *."$ext" ]] && return 0
+    done
+    return 1
+}
+
+is_static_file() {
+    case "${1,,}" in
+        *.jpg|*.jpeg|*.png|*.gif|*.webp|*.svg|*.pdf|*.txt|*.csv|*.zip) return 0 ;;
+    esac
+    return 1
+}
+
+in_upload_dir() {
+    local path="$1"
+    printf '%s' "$path" | grep -qiE "/${UPLOAD_DIR_PATTERN}(/|$)"
+}
+
+handle_event() {
+
+    local event="$1" path="$2"
+    local name="${path##*/}"
+
+    [[ -f "$path" ]] || return 0
+    web_path_excluded "$path" && return 0
+
+    local is_code=0 is_upload=0
+    is_code_file "$name" && is_code=1
+    in_upload_dir "$path" && is_upload=1
+
+    # A static file landing in an upload directory is the normal
+    # business of a CMS. Only look inside it when it is code, in
+    # an upload directory, or hidden.
+    if (( is_code == 0 )); then
+        if (( is_upload )) && is_static_file "$name"; then
+            # Cheap check for the polyglot case only.
+            if ! run_scan 5 grep -qlI -e '<?php' -e '<?=' "$path" 2>/dev/null; then
+                return 0
+            fi
+        elif [[ "$name" != .* ]]; then
+            return 0
+        fi
+    fi
+
+    web_file_facts "$path" || return 0
+
+    score_reset
+
+    if (( is_code )); then
+        score_add 20 "PHP file event ($event)"
+        if (( is_upload )); then
+            score_add 45 "created in an upload/static directory"
+            web_php_reachable "$path" && score_add 25 "Nginx executes PHP for this path"
+        fi
+    else
+        score_add 35 "PHP open tag inside a static file in an upload directory"
+    fi
+
+    web_owner_is_service_account "$WF_OWNER" \
+        && score_add 25 "written by the web service account ($WF_OWNER)"
+
+    [[ "$name" == .* ]] && score_add 20 "hidden file"
+
+    printf '%s' "$name" | grep -qE '\.(jpe?g|png|gif|pdf|docx?|txt)\.(php|phtml|phar|php[0-9])$' \
+        && score_add 45 "double extension"
+
+    (( WF_SIZE > 0 && WF_SIZE < 700 )) \
+        && score_add 10 "very small file (${WF_SIZE} bytes)"
+
+    # Content indicators, bounded read.
+    local content
+    content="$(web_file_head "$path" 65536)"
+
+    if [[ -n "$content" ]]; then
+        if printf '%s' "$content" | grep -qE '\b(eval|assert)[[:space:]]*\([^;]{0,80}(base64_decode|gzinflate|str_rot13|\$_(GET|POST|REQUEST|COOKIE))'; then
+            score_add 50 "eval of a decoded or request supplied payload"
+        fi
+        if printf '%s' "$content" | grep -qE '\b(system|exec|shell_exec|passthru|proc_open|popen)[[:space:]]*\([^;]{0,60}\$_(GET|POST|REQUEST|COOKIE)'; then
+            score_add 50 "command execution on request input"
+        fi
+        if printf '%s' "$content" | grep -qE '\bmove_uploaded_file[[:space:]]*\('; then
+            score_add 10 "upload handler"
+        fi
+    fi
+
+    local severity
+    severity="$(score_severity)"
+    [[ "$severity" == "INFO" ]] && return 0
+
+    local fingerprint
+    fingerprint="$(printf '%s|realtime|%s|%s' "$ITM_HOSTNAME" "$path" "$WF_SHA" \
+        | sha256sum 2>/dev/null | cut -c1-32)"
+
+    local snapshot=""
+    if [[ "$severity" == "CRITICAL" || "$severity" == "HIGH" ]]; then
+        snapshot="$(evidence_snapshot "$path" "$fingerprint" "realtime event=$event
+$SCORE_REASONS")"
+    fi
+
+    log_event "$severity $event $path score=$SCORE_TOTAL sha256=$WF_SHA"
+
+    # add_finding in standalone mode writes the JSONL record and
+    # dispatches the Telegram alert immediately.
+    add_finding "$severity" \
+        "Realtime: suspicious web file $( [[ "$event" == *CREATE* || "$event" == *MOVED_TO* ]] && echo created || echo modified )" \
+        id="realtime:$path" \
+        path="$path" \
+        hash="$WF_SHA" \
+        confidence="$(score_confidence)" \
+        reasons="$SCORE_REASONS" \
+        evidence="event=$event
+owner=${WF_OWNER}:${WF_GROUP} mode=${WF_MODE} size=${WF_SIZE}
+sha256=${WF_SHA}${snapshot:+
+evidence copy=${snapshot}}" \
+        action="Do not delete yet - the file may disappear on its own and the copy in the evidence directory may be the only record. Check the Nginx access log for the request at $(date '+%H:%M') and confirm whether PHP execution is enabled for this directory."
+}
+
+# ------------------------------------------------------------
+# Main loop
+# ------------------------------------------------------------
+
+main() {
+
+    if ! have_cmd inotifywait; then
+        log_event "inotifywait not available - install inotify-tools. Realtime monitoring disabled."
+        exit 1
+    fi
+
+    web_load_iocs
+
+    if ! role_is web_application; then
+        log_event "no web application workload on this host - realtime web monitoring not applicable"
+        # Exit cleanly: the unit is installed everywhere, and
+        # doing nothing on a database or hypervisor host is the
+        # correct behaviour, not a failure.
+        exit 0
+    fi
+
+    if ! build_watch_list; then
+        log_event "no web root resolved - set WEB_ROOTS in $ITM_AUDIT_CONF"
+        exit 1
+    fi
+
+    mkdir -p "$ITM_LOG_DIR" 2>/dev/null || true
+
+    local exclude
+    exclude="$(build_exclude_regex)"
+
+    log_event "watching ${#REALTIME_WATCH_DIRS[@]} directory tree(s): ${REALTIME_WATCH_DIRS[*]}"
+
+    # --exclude keeps session/cache churn from both flooding the
+    # classifier and exhausting the inotify watch limit.
+    inotifywait -m -r \
+        -e create -e modify -e moved_to -e attrib -e close_write \
+        --exclude "$exclude" \
+        --format '%e|%w%f' \
+        "${REALTIME_WATCH_DIRS[@]}" 2>/dev/null |
+    while IFS='|' read -r event path; do
+
+        [[ -n "$path" ]] || continue
+
+        # A single classification must never be able to stall
+        # the event loop.
+        handle_event "$event" "$path" || true
+
+    done
+
+    log_event "inotifywait exited - systemd will restart the watcher"
+}
+
+# Sourcing this file with ITM_REALTIME_NO_MAIN=1 loads the
+# classifier without starting the watch loop, so the event
+# handling can be exercised against fixtures.
+[[ "${ITM_REALTIME_NO_MAIN:-0}" == "1" ]] || main "$@"

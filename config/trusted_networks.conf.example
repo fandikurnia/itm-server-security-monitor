@@ -1,0 +1,26 @@
+# ============================================================
+# ITM Server Security Monitor
+# Trusted network policy
+#
+# Installed to /etc/security-monitor/trusted_networks.conf
+#
+# Used by the audit modules to decide whether a remote address
+# is inside the managed estate. An outbound session from a root
+# process to an address outside these networks is a finding.
+#
+# One entry per line. IPv4 CIDR, or a bare address. Comments
+# start with #. RFC1918 space and loopback are always treated
+# as private, whether or not they are listed here.
+#
+# The installer generates this file from the TRUSTED_NETWORKS
+# value in install.sh, which is the same list used for the
+# Fail2Ban ignoreip policy, so both stay in step.
+# ============================================================
+
+127.0.0.0/8
+::1
+
+# ITM management networks
+192.168.100.0/24
+192.168.111.0/24
+103.166.224.0/24

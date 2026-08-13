@@ -1,0 +1,35 @@
+[Unit]
+Description=ITM Web Content Security Scan (read only)
+Documentation=https://github.com/YOUR-ORG/itm-server-security-monitor
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Role aware: on a host with no web application workload this
+# exits immediately after the lightweight classification, having
+# touched no filesystem.
+ExecStart=/usr/local/sbin/itm-security audit role webshell gambling seo integrity nginx --telegram
+
+User=root
+Group=root
+
+# 2 = HIGH findings, 3 = CRITICAL findings. Both are successful
+# scans, not unit failures.
+SuccessExitStatus=0 2 3
+
+# A content scan must never compete with page rendering.
+Nice=15
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+TimeoutStartSec=3600
+
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=full
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

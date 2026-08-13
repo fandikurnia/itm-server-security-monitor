@@ -1,0 +1,31 @@
+# ============================================================
+# ITM Server Security Monitor
+# Web scan exclusions
+#
+# Installed to /etc/security-monitor/ioc/web-exclusions.conf
+#
+# Shell globs matched against the FULL PATH. A matching file is
+# never reported by any web content module.
+#
+# Use this for confirmed false positives only, and write down
+# why. Every entry here is a hole in the detection: a webshell
+# dropped at an excluded path will not be reported.
+#
+# Prefer the narrowest possible glob. Exclude a file, not a
+# directory tree, wherever you can.
+# ============================================================
+
+# --- example: a legitimate database tool, confirmed by hash ---
+# /website/tools/adminer.php
+
+# --- example: an editorial article that legitimately discusses
+#     online gambling regulation ---
+# /website/deputi1/berita/2026/regulasi-judi-online.html
+
+# --- example: a vendor library that uses eval() by design ---
+# /website/*/vendor/twig/twig/src/Environment.php
+
+# --- framework caches that are regenerated constantly and are
+#     already excluded by WEB_EXCLUDE_DIRS; listed here as a
+#     reminder of the safe pattern ---
+# /website/*/storage/framework/views/*.php

@@ -1,0 +1,23 @@
+# ============================================================
+# ITM Server Security Monitor
+# Post-compromise audit log rotation
+#
+# Installed to /etc/logrotate.d/itm-security
+#
+# These files are incident evidence, so they are kept for a
+# year and compressed rather than truncated aggressively.
+# ============================================================
+
+/var/log/itm-security/post-compromise-audit.log
+/var/log/itm-security/post-compromise-audit.json
+{
+    weekly
+    rotate 52
+    size 20M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    su root root
+}

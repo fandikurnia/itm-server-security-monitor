@@ -1,0 +1,220 @@
+# ============================================================
+# ITM Server Security Monitor
+# Post-compromise audit configuration
+#
+# Installed to /etc/security-monitor/audit.conf (mode 0600).
+# The installer creates it from this example only when it does
+# not already exist, so local edits are never overwritten.
+#
+# This file is sourced by bash. Keep it to KEY="value" lines.
+# It contains policy only - no credentials. Telegram
+# credentials stay in telegram.conf and are never read by the
+# audit modules.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# HOST TRUST
+#
+# This is an operator decision, not a scanner decision. The
+# audit never declares a host CLEAN.
+#
+#   UNVERIFIED  no trust assessment has been made (default)
+#   UNTRUSTED   this host held a root level compromise and has
+#               not been rebuilt; it stays UNTRUSTED no matter
+#               how many clean audits it passes
+#   REBUILT     rebuilt from trusted media after the incident
+# ------------------------------------------------------------
+
+HOST_TRUST_STATUS="UNVERIFIED"
+HOST_TRUST_REASON=""
+
+# Example for a host that was rooted and cleaned but not rebuilt:
+# HOST_TRUST_STATUS="UNTRUSTED"
+# HOST_TRUST_REASON="PAM credential stealer + systemd persistence, 2026-07; cleaned in place, not rebuilt"
+
+
+# ------------------------------------------------------------
+# TELEGRAM ALERTING
+#
+# Alerts are deduplicated by finding fingerprint so a standing
+# finding does not alert on every run.
+# ------------------------------------------------------------
+
+# Minimum severity that triggers a Telegram alert.
+TELEGRAM_MIN_SEVERITY="HIGH"
+
+# Maximum individual alerts per run. Anything beyond this is
+# rolled up into a single summary message.
+TELEGRAM_MAX_ALERTS=10
+
+# Do not re-alert the same finding within this many hours.
+ALERT_REPEAT_HOURS=24
+
+# How long fingerprints are kept for NEW vs RECURRING scoring.
+ALERT_STATE_RETENTION_DAYS=30
+
+
+# ------------------------------------------------------------
+# SCAN LIMITS
+#
+# This is a production server. Every scan is bounded.
+# ------------------------------------------------------------
+
+# Wall clock limit for short commands (ss, systemctl, nginx -T).
+CMD_TIMEOUT=20
+
+# Wall clock limit for each find/grep sweep.
+FIND_TIMEOUT=120
+
+
+# ------------------------------------------------------------
+# WEB ROOTS
+#
+# Roots discovered from the effective Nginx configuration are
+# added automatically. List anything Nginx does not reveal.
+# ------------------------------------------------------------
+
+WEB_ROOTS="/website /var/www"
+
+WEB_SCAN_MAXDEPTH=10
+WEB_RECENT_DAYS=7
+WEB_MAX_REPORTED=25
+
+# Directories skipped by every web scan. Session and cache
+# directories are excluded because they hold large volumes of
+# machine generated files.
+WEB_EXCLUDE_DIRS="node_modules .git .svn .hg cache caches sessions session tmp temp logs log backup backups"
+
+# Set to 0 to also scan composer/npm vendor directories. Off by
+# default: vendor trees are large and produce noisy matches.
+WEB_EXCLUDE_VENDOR=1
+
+# Directory names treated as upload/static content, where PHP
+# execution must never be enabled. POSIX extended regex.
+UPLOAD_DIR_PATTERN='(data|upload|uploads|file|files|image|images|img|media|storage|attachment|attachments|berkas|dokumen|foto|galeri)'
+
+
+# ------------------------------------------------------------
+# NETWORK POLICY
+#
+# Trusted networks live in trusted_networks.conf, not here.
+# ------------------------------------------------------------
+
+# Listening ports that are expected on this estate. Anything
+# else bound to a non loopback address is reported for review.
+ALLOWED_LISTEN_PORTS="22 25 53 80 110 143 123 443 465 587 993 995 3306"
+
+# Ports treated as database services for exposure scoring.
+DB_PORTS="1433 1521 3306 5432 6379 9200 11211 27017 33060"
+
+# Root owned processes allowed to hold outbound sessions.
+OUTBOUND_ALLOW_PROCS="sshd apt apt-get aptd unattended-upgr packagekitd dnf yum rpm chronyd ntpd systemd-timesyn postfix exim4 fail2ban-server curl wget"
+
+
+# ------------------------------------------------------------
+# ITM SELF ALLOWLIST
+#
+# ITM installs its own PAM hook and systemd units. They are
+# listed explicitly so the tool does not report itself, and so
+# that the exemption stays visible in every report.
+#
+# Removing an entry makes the audit flag ITM's own integration.
+# Adding an entry hides something from the audit - do that only
+# with a documented reason.
+# ------------------------------------------------------------
+
+PAM_EXEC_ALLOW="/usr/local/sbin/ssh-login-alert"
+
+ITM_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-security-audit.service itm-security-audit.timer itm-web-scan.service itm-web-scan.timer itm-web-realtime.service"
+
+ITM_OWN_BINARIES="/usr/local/sbin/security-notify /usr/local/sbin/ssh-login-alert /usr/local/sbin/security-file-monitor /usr/local/sbin/itm-command-relay /usr/local/sbin/itm-security /usr/local/sbin/itm-web-realtime"
+
+
+# ------------------------------------------------------------
+# DETECTION TUNING
+# ------------------------------------------------------------
+
+# Unit names seen in previous incidents on this estate. Matching
+# names are reported CRITICAL on sight.
+KNOWN_BAD_UNITS="defaults.service server-security.service"
+
+# A locally created systemd unit newer than this is reported for
+# change review.
+SYSTEMD_RECENT_DAYS=30
+
+# Directories no long lived service should execute from.
+# Home directories are scored separately: a user running a tool
+# from their own home is ordinary, the same binary running as
+# root or out of another account's home is not.
+VOLATILE_EXEC_PATHS="/tmp /var/tmp /dev/shm /run/shm /var/lock"
+USER_EXEC_PATHS="/home /root"
+
+# Commands whose output an intruder benefits from filtering.
+AUDIT_COMMANDS="ps ss netstat lsof strings strace ltrace top ls find grep who w last lastlog dmesg journalctl md5sum sha256sum stat file readlink du df crontab chattr lsattr"
+
+# Lowest PHP version considered supported on this estate.
+PHP_MIN_SUPPORTED="8.1"
+
+
+# ============================================================
+# WEB CONTENT MONITORING
+#
+# Modules: webshell, gambling, seo, integrity
+#
+# All of them are role aware: on a host with no web application
+# workload they report NOT APPLICABLE and never touch the disk.
+# ============================================================
+
+# Host role override. "auto" trusts the role detection module.
+# Use "yes" when an application is served in a way detection
+# cannot see, "no" to exclude this host from content scanning
+# regardless of what is running on it.
+WEB_WORKLOAD_OVERRIDE="auto"
+
+# Never read or hash a file larger than this (bytes). A video is
+# not a webshell and hashing it stalls the scan.
+WEB_MAX_FILE_BYTES=2097152
+
+# A file newer than this counts as "recently written" when
+# scoring. Recency is corroborating evidence, never proof.
+WEB_NEW_FILE_HOURS=72
+
+# Between full reconciliation passes the scheduled scan only
+# examines files newer than the previous run.
+WEB_FULL_SCAN_HOURS=24
+
+# Accounts the web server runs as. A file in application source
+# owned by one of these was written by the application itself,
+# which is not how deployments work.
+WEB_SERVICE_USERS="www-data nginx apache httpd php-fpm daemon"
+
+# Scoring thresholds. Raise to reduce noise, lower to catch more
+# at the cost of false positives. Every finding reports the
+# score and the reasons that produced it.
+SCORE_THRESHOLD_CRITICAL=80
+SCORE_THRESHOLD_HIGH=55
+SCORE_THRESHOLD_MEDIUM=30
+SCORE_THRESHOLD_LOW=12
+
+# Distinct gambling terms required before a file is considered
+# at all. 1 keeps single-term files at INFO/LOW; raise to 2 on
+# sites that legitimately publish about online gambling.
+GAMBLING_MIN_HITS=1
+
+# Access log lines sampled per log file.
+ACCESSLOG_MAX_LINES=20000
+
+# Copy suspected malicious files to /var/lib/itm-security/evidence
+# (root only, 0600). The original is never moved or deleted.
+EVIDENCE_COPY=1
+EVIDENCE_MAX_BYTES=1048576
+
+# Scan priority. The scanner must never compete with page
+# rendering on a production server.
+SCAN_NICE=15
+SCAN_IONICE=1
+
+# Integrity findings reported per run before the report is
+# truncated. A larger change set is a deployment, not an alert.
+INTEGRITY_MAX_REPORT=40

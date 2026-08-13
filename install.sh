@@ -25,7 +25,63 @@ CHAT_ID="${CHAT_ID:-}"
 TELEGRAM_CONF="/etc/security-monitor/telegram.conf"
 
 # ITM trusted networks
+#
+# Single source of truth for both the Fail2Ban ignoreip policy
+# and the post-compromise audit's trusted network policy.
 TRUSTED_NETWORKS="127.0.0.1/8 ::1 192.168.100.0/24 192.168.111.0/24 103.166.224.0/24"
+
+# ============================================================
+# POST-COMPROMISE AUDIT
+# ============================================================
+
+AUDIT_CONF="/etc/security-monitor/audit.conf"
+TRUSTED_NET_CONF="/etc/security-monitor/trusted_networks.conf"
+
+AUDIT_LIB_DIR="/usr/local/lib/itm-security"
+AUDIT_MODULE_DIR="$AUDIT_LIB_DIR/modules"
+
+AUDIT_LOG_DIR="/var/log/itm-security"
+AUDIT_STATE_DIR="/var/lib/itm-security/audit-state"
+
+AUDIT_IOC_DIR="/etc/security-monitor/ioc"
+WEB_BASELINE_DIR="/var/lib/itm-security/web-baseline"
+WEB_SCAN_STATE_DIR="/var/lib/itm-security/scan-state"
+WEB_EVIDENCE_DIR="/var/lib/itm-security/evidence"
+
+AUDIT_MODULES=(
+    audit_role.sh
+    audit_process.sh
+    audit_network.sh
+    audit_pam.sh
+    audit_systemd.sh
+    audit_command.sh
+    audit_nginx.sh
+    audit_php.sh
+    audit_web.sh
+    audit_webshell.sh
+    audit_gambling.sh
+    audit_seo.sh
+    audit_integrity.sh
+    audit_fail2ban.sh
+)
+
+# IOC databases. Installed only when absent, so operator tuning
+# and site specific allowlists are never overwritten.
+AUDIT_IOC_FILES=(
+    gambling-keywords.conf
+    webshell-patterns.conf
+    seo-poisoning-patterns.conf
+    suspicious-filenames.conf
+    web-exclusions.conf
+)
+
+# Set to 0 to install the web monitoring without enabling the
+# three hourly scan or the realtime watcher.
+INSTALL_WEB_MONITOR="${INSTALL_WEB_MONITOR:-1}"
+
+# Set INSTALL_AUDIT_TIMER=0 to install the audit tooling without
+# enabling the nightly run.
+INSTALL_AUDIT_TIMER="${INSTALL_AUDIT_TIMER:-1}"
 
 # ============================================================
 # REQUIRED REPOSITORY FILES
@@ -40,7 +96,26 @@ REQUIRED_FILES=(
     "$SCRIPT_DIR/systemd/security-file-monitor.service"
     "$SCRIPT_DIR/systemd/itm-command-monitor.service"
     "$SCRIPT_DIR/fail2ban/action.d/telegram-security.conf"
+    "$SCRIPT_DIR/bin/itm-security"
+    "$SCRIPT_DIR/lib/itm-audit-common.sh"
+    "$SCRIPT_DIR/config/audit.conf.example"
+    "$SCRIPT_DIR/systemd/itm-security-audit.service"
+    "$SCRIPT_DIR/systemd/itm-security-audit.timer"
+    "$SCRIPT_DIR/logrotate/itm-security"
+    "$SCRIPT_DIR/lib/itm-web-common.sh"
+    "$SCRIPT_DIR/bin/itm-web-realtime"
+    "$SCRIPT_DIR/systemd/itm-web-scan.service"
+    "$SCRIPT_DIR/systemd/itm-web-scan.timer"
+    "$SCRIPT_DIR/systemd/itm-web-realtime.service"
 )
+
+for ioc in "${AUDIT_IOC_FILES[@]}"; do
+    REQUIRED_FILES+=("$SCRIPT_DIR/config/${ioc}.example")
+done
+
+for module in "${AUDIT_MODULES[@]}"; do
+    REQUIRED_FILES+=("$SCRIPT_DIR/modules/$module")
+done
 
 for file in "${REQUIRED_FILES[@]}"; do
     if [[ ! -f "$file" ]]; then
@@ -279,6 +354,176 @@ install \
     /usr/local/sbin/itm-command-relay
 
 # ============================================================
+# INSTALL POST-COMPROMISE AUDIT
+#
+# The audit is read only. It reports and alerts; it never
+# kills a process, deletes a file, disables a service or edits
+# an Nginx, PHP or PAM configuration.
+# ============================================================
+
+echo "[+] Installing post-compromise audit..."
+
+install \
+    -o root \
+    -g root \
+    -m 0700 \
+    -d "$AUDIT_LIB_DIR" "$AUDIT_MODULE_DIR"
+
+install \
+    -o root \
+    -g root \
+    -m 0600 \
+    "$SCRIPT_DIR/lib/itm-audit-common.sh" \
+    "$AUDIT_LIB_DIR/itm-audit-common.sh"
+
+for module in "${AUDIT_MODULES[@]}"; do
+
+    install \
+        -o root \
+        -g root \
+        -m 0600 \
+        "$SCRIPT_DIR/modules/$module" \
+        "$AUDIT_MODULE_DIR/$module"
+
+    bash -n "$AUDIT_MODULE_DIR/$module"
+
+done
+
+install \
+    -o root \
+    -g root \
+    -m 0600 \
+    "$SCRIPT_DIR/lib/itm-web-common.sh" \
+    "$AUDIT_LIB_DIR/itm-web-common.sh"
+
+install \
+    -o root \
+    -g root \
+    -m 0700 \
+    "$SCRIPT_DIR/bin/itm-security" \
+    /usr/local/sbin/itm-security
+
+install \
+    -o root \
+    -g root \
+    -m 0700 \
+    "$SCRIPT_DIR/bin/itm-web-realtime" \
+    /usr/local/sbin/itm-web-realtime
+
+bash -n /usr/local/sbin/itm-security
+bash -n /usr/local/sbin/itm-web-realtime
+
+echo "[+] Audit modules installed: ${#AUDIT_MODULES[@]}"
+
+# ------------------------------------------------------------
+# Audit output directories
+#
+# Logs are evidence: keep them root readable only, and never
+# remove them on upgrade or uninstall.
+# ------------------------------------------------------------
+
+install -o root -g root -m 0750 -d "$AUDIT_LOG_DIR"
+install -o root -g root -m 0700 -d "$AUDIT_STATE_DIR"
+install -o root -g root -m 0700 -d "$WEB_BASELINE_DIR"
+install -o root -g root -m 0700 -d "$WEB_SCAN_STATE_DIR"
+install -o root -g root -m 0700 -d "$WEB_EVIDENCE_DIR"
+
+# ------------------------------------------------------------
+# IOC databases
+#
+# Keyword and pattern lists live outside the modules so they can
+# be tuned per site. Existing files are never overwritten: an
+# operator's allowlist is not the installer's to discard.
+# ------------------------------------------------------------
+
+install -o root -g root -m 0700 -d "$AUDIT_IOC_DIR"
+
+for ioc in "${AUDIT_IOC_FILES[@]}"; do
+
+    if [[ -f "$AUDIT_IOC_DIR/$ioc" ]]; then
+        echo "[+] Existing IOC list preserved: $ioc"
+    else
+        install \
+            -o root \
+            -g root \
+            -m 0600 \
+            "$SCRIPT_DIR/config/${ioc}.example" \
+            "$AUDIT_IOC_DIR/$ioc"
+        echo "[+] IOC list installed: $ioc"
+    fi
+
+done
+
+# ------------------------------------------------------------
+# Audit configuration
+#
+# Existing files are never overwritten, so local tuning and the
+# operator's host trust decision survive a reinstall.
+# ------------------------------------------------------------
+
+if [[ -f "$AUDIT_CONF" ]]; then
+
+    echo "[+] Existing audit.conf preserved."
+
+else
+
+    install \
+        -o root \
+        -g root \
+        -m 0600 \
+        "$SCRIPT_DIR/config/audit.conf.example" \
+        "$AUDIT_CONF"
+
+    echo "[+] audit.conf created from example."
+
+fi
+
+if [[ -f "$TRUSTED_NET_CONF" ]]; then
+
+    echo "[+] Existing trusted_networks.conf preserved."
+
+else
+
+    #
+    # Generated from TRUSTED_NETWORKS so the audit policy and
+    # the Fail2Ban ignoreip policy cannot drift apart.
+    #
+    {
+        echo "# ITM Server Security Monitor"
+        echo "# Trusted network policy - generated by install.sh on $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "#"
+        echo "# Edit freely: the installer will not overwrite this file again."
+        echo
+        for net in $TRUSTED_NETWORKS; do
+            echo "$net"
+        done
+    } > "$TRUSTED_NET_CONF"
+
+    chown root:root "$TRUSTED_NET_CONF"
+    chmod 600 "$TRUSTED_NET_CONF"
+
+    echo "[+] trusted_networks.conf created."
+
+fi
+
+# ------------------------------------------------------------
+# Log rotation
+# ------------------------------------------------------------
+
+if [[ -d /etc/logrotate.d ]]; then
+
+    install \
+        -o root \
+        -g root \
+        -m 0644 \
+        "$SCRIPT_DIR/logrotate/itm-security" \
+        /etc/logrotate.d/itm-security
+
+    echo "[+] Log rotation installed."
+
+fi
+
+# ============================================================
 # INSTALL SYSTEMD SERVICES
 # ============================================================
 
@@ -297,6 +542,41 @@ install \
     -m 0644 \
     "$SCRIPT_DIR/systemd/itm-command-monitor.service" \
     /etc/systemd/system/itm-command-monitor.service
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-security-audit.service" \
+    /etc/systemd/system/itm-security-audit.service
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-security-audit.timer" \
+    /etc/systemd/system/itm-security-audit.timer
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-web-scan.service" \
+    /etc/systemd/system/itm-web-scan.service
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-web-scan.timer" \
+    /etc/systemd/system/itm-web-scan.timer
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-web-realtime.service" \
+    /etc/systemd/system/itm-web-realtime.service
 
 # ============================================================
 # SSH LOGIN PAM ALERT
@@ -595,6 +875,59 @@ systemctl enable --now \
 systemctl enable --now \
     itm-command-monitor.service
 
+# ------------------------------------------------------------
+# Nightly audit
+#
+# The timer runs the audit, not a remediation. Set
+# INSTALL_AUDIT_TIMER=0 to install the tooling without the
+# scheduled run.
+# ------------------------------------------------------------
+
+if [[ "$INSTALL_AUDIT_TIMER" == "1" ]]; then
+
+    systemctl enable --now \
+        itm-security-audit.timer
+
+    echo "[+] Nightly audit timer enabled."
+
+else
+
+    echo "[+] Audit timer NOT enabled (INSTALL_AUDIT_TIMER=0)."
+    echo "    Run manually: itm-security audit"
+
+fi
+
+# ------------------------------------------------------------
+# Web content monitoring
+#
+# Two layers:
+#   itm-web-scan.timer      reconciliation every three hours
+#   itm-web-realtime        inotify, catches a file that exists
+#                           for only a few minutes
+#
+# Both are role aware: on a host with no web application
+# workload the scan exits after a lightweight classification and
+# the realtime watcher exits 0 without watching anything.
+# ------------------------------------------------------------
+
+if [[ "$INSTALL_WEB_MONITOR" == "1" ]]; then
+
+    systemctl enable --now itm-web-scan.timer
+
+    if command -v inotifywait >/dev/null 2>&1; then
+        systemctl enable --now itm-web-realtime.service
+        echo "[+] Web scan timer and realtime monitor enabled."
+    else
+        echo "[!] inotify-tools missing - realtime web monitor NOT started."
+        echo "    Scheduled scanning still runs every three hours."
+    fi
+
+else
+
+    echo "[+] Web monitoring NOT enabled (INSTALL_WEB_MONITOR=0)."
+
+fi
+
 # ============================================================
 # FAIL2BAN VALIDATION
 # ============================================================
@@ -671,6 +1004,58 @@ else
     check_result "Fail2Ban:" "FAILED"
 fi
 
+if [[ -x /usr/local/sbin/itm-security ]]; then
+    check_result "Audit CLI:" "OK"
+else
+    check_result "Audit CLI:" "MISSING"
+fi
+
+AUDIT_MODULES_FOUND="$(find "$AUDIT_MODULE_DIR" -maxdepth 1 -name 'audit_*.sh' 2>/dev/null | wc -l)"
+check_result "Audit modules:" "$AUDIT_MODULES_FOUND / ${#AUDIT_MODULES[@]}"
+
+if [[ "$INSTALL_AUDIT_TIMER" == "1" ]]; then
+    if systemctl is-active --quiet itm-security-audit.timer; then
+        check_result "Audit timer:" "ACTIVE"
+    else
+        check_result "Audit timer:" "FAILED"
+    fi
+else
+    check_result "Audit timer:" "DISABLED BY OPERATOR"
+fi
+
+if [[ -f "$AUDIT_CONF" ]]; then
+    check_result "Audit config:" "OK"
+else
+    check_result "Audit config:" "MISSING"
+fi
+
+if [[ "$INSTALL_WEB_MONITOR" == "1" ]]; then
+    if systemctl is-active --quiet itm-web-scan.timer; then
+        check_result "Web scan timer:" "ACTIVE (00,03,06,09,12,15,18,21)"
+    else
+        check_result "Web scan timer:" "FAILED"
+    fi
+
+    if systemctl is-active --quiet itm-web-realtime.service; then
+        check_result "Realtime web monitor:" "ACTIVE"
+    elif command -v inotifywait >/dev/null 2>&1; then
+        check_result "Realtime web monitor:" "NOT APPLICABLE (no web workload)"
+    else
+        check_result "Realtime web monitor:" "inotify-tools MISSING"
+    fi
+else
+    check_result "Web monitoring:" "DISABLED BY OPERATOR"
+fi
+
+IOC_FOUND="$(find "$AUDIT_IOC_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)"
+check_result "IOC lists:" "$IOC_FOUND / ${#AUDIT_IOC_FILES[@]}"
+
+HOST_ROLE_LINE="$(/usr/local/sbin/itm-security audit role --dry-run --quiet 2>/dev/null | grep -m1 'host role:' || true)"
+check_result "Host role:" "${HOST_ROLE_LINE#*host role: }"
+
+check_result "Host trust status:" \
+    "$(grep -E '^HOST_TRUST_STATUS=' "$AUDIT_CONF" 2>/dev/null | cut -d'"' -f2 || echo UNVERIFIED)"
+
 check_result "OS family:" "$OS_FAMILY"
 check_result "Global Bash RC:" "$GLOBAL_BASHRC"
 check_result "Fail2Ban backend:" "$FAIL2BAN_BACKEND"
@@ -711,6 +1096,35 @@ echo "  systemctl status fail2ban --no-pager"
 echo "  fail2ban-client status sshd"
 echo "  fail2ban-client get sshd ignoreip"
 echo "  journalctl -t itm-command-monitor -n 20 --no-pager"
+echo
+
+echo "Post-compromise audit (read only, never modifies the host):"
+echo
+echo "  itm-security self-test"
+echo "  itm-security audit --dry-run     # writes nothing, sends nothing"
+echo "  itm-security audit"
+echo "  itm-security audit nginx web     # single modules"
+echo "  itm-security audit --json | jq ."
+echo
+echo "  itm-security web status"
+echo "  itm-security web baseline        # after a verified clean deployment"
+echo "  systemctl status itm-web-realtime --no-pager"
+echo "  systemctl list-timers itm-web-scan.timer"
+echo "  systemctl list-timers itm-security-audit.timer"
+echo "  less $AUDIT_LOG_DIR/post-compromise-audit.log"
+echo
+
+echo "IMPORTANT - host trust:"
+echo
+echo "  If this host was ever root compromised, record it in:"
+echo "  $AUDIT_CONF"
+echo
+echo '      HOST_TRUST_STATUS="UNTRUSTED"'
+echo '      HOST_TRUST_REASON="<incident reference>"'
+echo
+echo "  The audit never reports a host as CLEAN. A host that held a"
+echo "  root level compromise stays UNTRUSTED until it is rebuilt"
+echo "  from trusted media."
 echo
 
 echo "Command monitoring test:"
