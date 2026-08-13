@@ -1,0 +1,33 @@
+[Unit]
+Description=ITM Post-Compromise Security Audit (read only)
+Documentation=https://github.com/YOUR-ORG/itm-server-security-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Audit only. The tool never kills a process, deletes a file,
+# disables a service or edits a configuration.
+ExecStart=/usr/local/sbin/itm-security audit --telegram
+
+User=root
+Group=root
+
+# Exit codes 2 and 3 mean HIGH and CRITICAL findings were
+# reported. That is a successful audit run, not a unit failure.
+SuccessExitStatus=0 2 3
+
+# Keep the audit out of the way of production traffic.
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+TimeoutStartSec=1800
+
+NoNewPrivileges=true
+ProtectHome=read-only
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

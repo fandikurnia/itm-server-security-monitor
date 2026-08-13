@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# ITM Server Security Monitor
+# Post-Compromise Security Audit and Hardening Monitor
+#
+# AUDIT ONLY.
+#
+# This command inspects the host and reports. It never kills a
+# process, deletes a file, disables a service, installs a
+# package or edits an Nginx, PHP or PAM configuration.
+#
+# Usage:
+#   itm-security audit                 all modules
+#   itm-security audit process         one or more modules
+#   itm-security audit --json          JSON array on stdout
+#   itm-security audit --telegram      alert on HIGH/CRITICAL
+#   itm-security audit --dry-run       nothing written, nothing sent
+#   itm-security self-test             readiness check
+# ============================================================
+
+set -uo pipefail
+
+# ------------------------------------------------------------
+# Locate the library and modules
+#
+# Installed layout is used when present; otherwise the layout
+# of a git checkout, so the tool can be exercised without
+# installing anything.
+# ------------------------------------------------------------
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+ITM_LIB_DIR="${ITM_LIB_DIR:-/usr/local/lib/itm-security}"
+
+if [[ ! -r "$ITM_LIB_DIR/itm-audit-common.sh" ]]; then
+    if [[ -r "$SCRIPT_DIR/../lib/itm-audit-common.sh" ]]; then
+        ITM_LIB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+        ITM_MODULE_DIR="$ITM_LIB_DIR/modules"
+        ITM_LIB_DIR="$ITM_LIB_DIR/lib"
+    else
+        echo "[ERROR] itm-audit-common.sh not found. Looked in:" >&2
+        echo "        $ITM_LIB_DIR" >&2
+        echo "        $SCRIPT_DIR/../lib" >&2
+        exit 1
+    fi
+fi
+
+ITM_MODULE_DIR="${ITM_MODULE_DIR:-$ITM_LIB_DIR/modules}"
+
+# shellcheck source=../lib/itm-audit-common.sh
+source "$ITM_LIB_DIR/itm-audit-common.sh"
+
+# ------------------------------------------------------------
+# Module registry
+#
+# Order matters: nginx runs before php and web, because both
+# consume the document roots and fastcgi targets it discovers.
+# ------------------------------------------------------------
+
+ITM_ALL_MODULES="process network pam systemd command nginx php web fail2ban"
+
+module_file() {
+    case "$1" in
+        process)  printf '%s' "audit_process.sh" ;;
+        network)  printf '%s' "audit_network.sh" ;;
+        pam)      printf '%s' "audit_pam.sh" ;;
+        systemd)  printf '%s' "audit_systemd.sh" ;;
+        command)  printf '%s' "audit_command.sh" ;;
+        nginx)    printf '%s' "audit_nginx.sh" ;;
+        php)      printf '%s' "audit_php.sh" ;;
+        web)      printf '%s' "audit_web.sh" ;;
+        fail2ban) printf '%s' "audit_fail2ban.sh" ;;
+        *)        return 1 ;;
+    esac
+}
+
+usage() {
+    cat <<'EOF'
+ITM Server Security Monitor - post-compromise audit
+
+Usage:
+  itm-security audit [module ...] [options]
+  itm-security self-test
+  itm-security version
+  itm-security help
+
+Modules:
+  process     running process integrity, deleted and fileless executables
+  network     listeners, exposure policy, root owned outbound sessions
+  pam         PAM stack integrity, pam_exec credential capture
+  systemd     malicious unit persistence
+  command     wrapper binaries hiding processes, ports and files
+  nginx       PHP execution in upload/data document roots
+  php         PHP-FPM versions, pools and production settings
+  web         web filesystem: webshells, artefacts, permissions
+  fail2ban    service, jail, backend and SSH port coverage
+
+  With no module named, every module runs.
+
+Options:
+  --json              print findings as a JSON array on stdout
+  --telegram          send HIGH/CRITICAL findings to Telegram (deduplicated)
+  --min-severity SEV  Telegram threshold: INFO LOW MEDIUM HIGH CRITICAL
+  --dry-run           run everything, write nothing, send nothing
+  --quiet             suppress the human readable report
+  --no-log            do not append to the log and JSON files
+  --conf FILE         use an alternative audit.conf
+  -h, --help          this help
+
+Exit codes:
+  0  no finding at or above MEDIUM
+  1  usage or environment error
+  2  HIGH findings present
+  3  CRITICAL findings present
+
+This command is read only. It never kills a process, deletes a
+file, disables a service or edits a configuration.
+EOF
+}
+
+# ------------------------------------------------------------
+# Self test
+# ------------------------------------------------------------
+
+self_test() {
+
+    local failures=0 warnings=0
+
+    printf '\n'
+    printf '============================================================\n'
+    printf ' ITM Security Audit - self test\n'
+    printf '============================================================\n\n'
+
+    check_line() {
+        local label="$1" state="$2" detail="${3:-}"
+        printf '%-34s %-8s %s\n' "$label" "$state" "$detail"
+    }
+
+    # ---- library and modules ----
+    check_line "Library" "OK" "$ITM_LIB_DIR/itm-audit-common.sh"
+
+    local m file
+    for m in $ITM_ALL_MODULES; do
+        file="$ITM_MODULE_DIR/$(module_file "$m")"
+        if [[ ! -r "$file" ]]; then
+            check_line "Module $m" "MISSING" "$file"
+            failures=$(( failures + 1 ))
+        elif bash -n "$file" 2>/dev/null; then
+            check_line "Module $m" "OK" "syntax valid"
+        else
+            check_line "Module $m" "ERROR" "syntax error in $file"
+            failures=$(( failures + 1 ))
+        fi
+    done
+
+    # ---- privileges ----
+    if is_root; then
+        check_line "Privileges" "OK" "running as root"
+    else
+        check_line "Privileges" "WARN" "not root - process, PAM and web checks will be partial"
+        warnings=$(( warnings + 1 ))
+    fi
+
+    # ---- configuration ----
+    if [[ -r "$ITM_AUDIT_CONF" ]]; then
+        check_line "audit.conf" "OK" "$ITM_AUDIT_CONF"
+    else
+        check_line "audit.conf" "WARN" "not found, built-in defaults apply"
+        warnings=$(( warnings + 1 ))
+    fi
+
+    if (( ${#TRUSTED_NETWORKS[@]} > 0 )); then
+        check_line "Trusted networks" "OK" "${#TRUSTED_NETWORKS[@]} entries"
+    else
+        check_line "Trusted networks" "WARN" "$ITM_TRUSTED_NET_CONF not readable"
+        warnings=$(( warnings + 1 ))
+    fi
+
+    check_line "Host trust status" "INFO" "$HOST_TRUST_STATUS"
+
+    # ---- output paths ----
+    if mkdir -p "$ITM_LOG_DIR" 2>/dev/null && [[ -w "$ITM_LOG_DIR" ]]; then
+        check_line "Log directory" "OK" "$ITM_LOG_DIR"
+    else
+        check_line "Log directory" "WARN" "$ITM_LOG_DIR not writable"
+        warnings=$(( warnings + 1 ))
+    fi
+
+    if mkdir -p "$ITM_STATE_DIR" 2>/dev/null && [[ -w "$ITM_STATE_DIR" ]]; then
+        check_line "State directory" "OK" "$ITM_STATE_DIR"
+    else
+        check_line "State directory" "WARN" "$ITM_STATE_DIR not writable - dedup disabled"
+        warnings=$(( warnings + 1 ))
+    fi
+
+    # ---- Telegram ----
+    if [[ -x "$ITM_NOTIFY_BIN" ]]; then
+        check_line "Telegram notifier" "OK" "$ITM_NOTIFY_BIN"
+    else
+        check_line "Telegram notifier" "WARN" "$ITM_NOTIFY_BIN not executable"
+        warnings=$(( warnings + 1 ))
+    fi
+
+    # Presence only. The credentials themselves are never read
+    # or printed by the audit tooling.
+    if [[ -r "$ITM_CONF_DIR/telegram.conf" ]]; then
+        check_line "Telegram config" "OK" "present (contents not read)"
+    else
+        check_line "Telegram config" "WARN" "not readable by this user"
+        warnings=$(( warnings + 1 ))
+    fi
+
+    # ---- external commands ----
+    local c
+    for c in ss find grep awk sed sha256sum stat readlink timeout; do
+        if have_cmd "$c"; then
+            check_line "Command: $c" "OK" ""
+        else
+            check_line "Command: $c" "WARN" "missing - related checks degrade"
+            warnings=$(( warnings + 1 ))
+        fi
+    done
+
+    for c in systemctl nginx php fail2ban-client dpkg-query rpm journalctl; do
+        if have_cmd "$c"; then
+            check_line "Command: $c" "OK" ""
+        else
+            check_line "Command: $c" "INFO" "not present - module will report SKIPPED"
+        fi
+    done
+
+    printf '\n'
+    printf 'OS family : %s (%s %s)\n' "$ITM_OS_FAMILY" "$ITM_OS_ID" "$ITM_OS_VERSION"
+    printf 'Host      : %s (%s)\n' "$ITM_HOSTNAME" "$ITM_PRIVATE_IP"
+    printf 'Version   : %s\n' "$ITM_AUDIT_VERSION"
+    printf '\n'
+
+    if (( failures > 0 )); then
+        printf 'RESULT: NOT READY - %d failure(s), %d warning(s)\n\n' "$failures" "$warnings"
+        return 1
+    fi
+
+    printf 'RESULT: READY - %d warning(s)\n' "$warnings"
+    printf 'Run a full audit without writing anything:\n'
+    printf '  itm-security audit --dry-run\n\n'
+    return 0
+}
+
+# ------------------------------------------------------------
+# Audit driver
+# ------------------------------------------------------------
+
+run_audit() {
+
+    local requested=("$@")
+    local modules=() m file
+
+    if (( ${#requested[@]} == 0 )); then
+        # shellcheck disable=SC2206
+        modules=( $ITM_ALL_MODULES )
+    else
+        # Preserve registry order regardless of argument order,
+        # so nginx always runs before php and web.
+        for m in $ITM_ALL_MODULES; do
+            local want
+            for want in "${requested[@]}"; do
+                [[ "$want" == "$m" ]] && modules+=("$m") && break
+            done
+        done
+    fi
+
+    if (( ${#modules[@]} == 0 )); then
+        say_err "[ERROR] No valid module selected."
+        say_err "Valid modules: $ITM_ALL_MODULES"
+        return 1
+    fi
+
+    audit_runtime_init
+
+    # A signal handler that only cleans up would let the script
+    # carry on with its temporary directory removed. Interrupt
+    # means stop.
+    trap audit_runtime_cleanup EXIT
+    trap 'audit_runtime_cleanup; say_err "[WARN] Audit interrupted - partial results discarded."; exit 130' INT
+    trap 'audit_runtime_cleanup; say_err "[WARN] Audit terminated - partial results discarded."; exit 143' TERM
+
+    audit_log INFO "audit start run_id=$ITM_RUN_ID modules=${modules[*]} version=$ITM_AUDIT_VERSION"
+
+    if (( ITM_QUIET == 0 )); then
+        say ""
+        say "${C_BOLD}ITM post-compromise audit${C_RESET} - $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        say "${C_DIM}host=$ITM_HOSTNAME modules=${modules[*]} mode=$( (( ITM_DRY_RUN )) && echo dry-run || echo normal )${C_RESET}"
+    fi
+
+    for m in "${modules[@]}"; do
+
+        file="$ITM_MODULE_DIR/$(module_file "$m")"
+
+        if [[ ! -r "$file" ]]; then
+            say_err "[WARN] Module file missing: $file"
+            continue
+        fi
+
+        # shellcheck disable=SC1090
+        source "$file"
+
+        if ! declare -F "run_audit_$m" >/dev/null; then
+            say_err "[WARN] Module $m did not define run_audit_$m"
+            continue
+        fi
+
+        "run_audit_$m"
+    done
+
+    audit_summary
+
+    commit_json
+    commit_seen_state
+    telegram_dispatch
+
+    audit_log INFO "audit end run_id=$ITM_RUN_ID max_severity=$ITM_MAX_SEV findings=$ITM_FINDING_TOTAL"
+
+    if (( ITM_JSON_MODE )); then
+        emit_json_array
+    fi
+
+    audit_exit_code
+}
+
+# ------------------------------------------------------------
+# Argument parsing
+# ------------------------------------------------------------
+
+main() {
+
+    local command="${1:-help}"
+    shift || true
+
+    local scopes=()
+
+    case "$command" in
+        -h|--help|help)
+            usage
+            return 0
+            ;;
+        version|--version|-V)
+            printf 'itm-security audit %s\n' "$ITM_AUDIT_VERSION"
+            return 0
+            ;;
+        self-test|selftest)
+            audit_load_config
+            audit_detect_os
+            audit_detect_host
+            self_test
+            return $?
+            ;;
+        audit)
+            ;;
+        *)
+            say_err "[ERROR] Unknown command: $command"
+            say_err "Run 'itm-security help' for usage."
+            return 1
+            ;;
+    esac
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --json)
+                ITM_JSON_MODE=1
+                ITM_QUIET=1
+                ;;
+            --telegram)
+                ITM_TELEGRAM=1
+                ;;
+            --min-severity)
+                shift || true
+                TELEGRAM_MIN_SEVERITY_OVERRIDE="${1:-HIGH}"
+                ;;
+            --dry-run|--dryrun)
+                ITM_DRY_RUN=1
+                ;;
+            --quiet|-q)
+                ITM_QUIET=1
+                ;;
+            --no-log)
+                ITM_WRITE_LOG=0
+                ITM_NO_LOG=1
+                ;;
+            --conf)
+                shift || true
+                ITM_AUDIT_CONF="${1:-$ITM_AUDIT_CONF}"
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            -*)
+                say_err "[ERROR] Unknown option: $1"
+                return 1
+                ;;
+            *)
+                if module_file "$1" >/dev/null 2>&1; then
+                    scopes+=("$1")
+                else
+                    say_err "[ERROR] Unknown module: $1"
+                    say_err "Valid modules: $ITM_ALL_MODULES"
+                    return 1
+                fi
+                ;;
+        esac
+        shift || true
+    done
+
+    audit_load_config
+    audit_init_color
+    audit_detect_os
+    audit_detect_host
+
+    # Command line wins over audit.conf.
+    if [[ -n "${TELEGRAM_MIN_SEVERITY_OVERRIDE:-}" ]]; then
+        TELEGRAM_MIN_SEVERITY="${TELEGRAM_MIN_SEVERITY_OVERRIDE^^}"
+    fi
+    if [[ -n "${ITM_NO_LOG:-}" ]]; then
+        ITM_WRITE_LOG=0
+    fi
+
+    run_audit ${scopes[@]+"${scopes[@]}"}
+}
+
+main "$@"

@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily ITM post-compromise security audit
+Documentation=https://github.com/YOUR-ORG/itm-server-security-monitor
+
+[Timer]
+# Outside business hours, with a spread so a fleet of servers
+# does not run the scan and hit Telegram at the same second.
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=1800
+
+# Run after boot if the machine was down at the scheduled time.
+Persistent=true
+
+Unit=itm-security-audit.service
+
+[Install]
+WantedBy=timers.target
