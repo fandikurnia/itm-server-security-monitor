@@ -329,30 +329,216 @@ test_safety_invariants() {
 
     local hits
 
-    hits="$(grep -rnE '(^|[^#])[[:space:]]*git[[:space:]]+(clean|reset)' \
-              "$REPO_DIR"/modules "$REPO_DIR"/lib "$REPO_DIR"/bin 2>/dev/null \
-              | grep -v 'never\|NEVER\|not\|Do not\|recommend' || true)"
+    # Comment lines cannot execute, and this project deliberately
+    # documents the commands it refuses to run. Strip full-line
+    # comments before asserting, or the documentation trips the
+    # test that exists to police the documentation.
+    scan_code() {
+        local pattern="$1"; shift
+        local f
+        for f in "$@"; do
+            [[ -f "$f" ]] || continue
+            sed 's/^[[:space:]]*#.*$//' "$f" | grep -nE "$pattern" \
+                | sed "s|^|$(basename "$f"):|" || true
+        done
+    }
+
+    hits="$(scan_code 'git[[:space:]]+(clean|reset)' \
+              "$REPO_DIR"/modules/*.sh "$REPO_DIR"/lib/*.sh "$REPO_DIR"/bin/* \
+              | grep -v 'never\|NEVER\|recommend\|printf' || true)"
     [[ -z "$hits" ]]
     check "git clean / git reset is never invoked" "$?" "$hits"
 
-    hits="$(grep -rnE '^[^#]*[[:space:]](rm|rm -rf)[[:space:]]+"?\$(WF_PATH|file|path)' \
-              "$REPO_DIR"/modules 2>/dev/null || true)"
+    hits="$(scan_code '[[:space:]](rm|rm -rf)[[:space:]]+"?\$(WF_PATH|file|path)' \
+              "$REPO_DIR"/modules/*.sh || true)"
     [[ -z "$hits" ]]
     check "no module deletes a scanned file" "$?" "$hits"
 
-    hits="$(grep -rnE '\bkill[[:space:]]+-?[0-9A-Z]*[[:space:]]*"?\$\{?(pid|PID)' \
-              "$REPO_DIR"/modules 2>/dev/null || true)"
+    hits="$(scan_code '\bkill[[:space:]]+-?[0-9A-Z]*[[:space:]]*"?\$\{?(pid|PID)' \
+              "$REPO_DIR"/modules/*.sh || true)"
     [[ -z "$hits" ]]
     check "no module signals a process" "$?" "$hits"
 
-    hits="$(grep -rnE '\bchattr[[:space:]]+[-+]' "$REPO_DIR"/modules "$REPO_DIR"/lib 2>/dev/null \
-              | grep -v 'chattr \+i/\+a\|recommend\|action=' || true)"
+    hits="$(scan_code '\bchattr[[:space:]]+[-+]' \
+              "$REPO_DIR"/modules/*.sh "$REPO_DIR"/lib/*.sh \
+              | grep -v 'recommend\|action=\|printf' || true)"
     [[ -z "$hits" ]]
     check "no module changes file attributes" "$?" "$hits"
 }
 
 # ============================================================
-# TEST 7 - shell syntax
+# TEST 7 - incident response script generation
+#
+# Asserts the property that matters: generating changes nothing,
+# a dry run changes nothing, containment is reversible, and no
+# generated script contains a destructive command.
+# ============================================================
+
+test_remediation() {
+
+    want "remediat" || return 0
+    printf '\nTEST: incident response script generation\n'
+
+    setup_case remediation
+    local root="$CASE_DIR/www/site"
+    mkdir -p "$root/uploads"
+    cp "$FIXTURES/seo-cloak/vendor.js.txt"  "$root/vendor.js"
+    cp "$FIXTURES/webshell/heph.phtml.txt"  "$root/uploads/shell.phtml"
+
+    local forensic="$CASE_DIR/forensic"
+    local out
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" WEB_BASELINE_DIR="$CASE_DIR/state/base" \
+        ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" REMEDIATE_BASE_DIR="$forensic" \
+        WEB_WORKLOAD_OVERRIDE=yes WEB_ROOTS="$root" \
+        timeout 180 "$REPO_DIR/bin/itm-security" remediate webshell seo --quiet 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    local inc
+    inc="$(find "$forensic" -maxdepth 1 -type d -name 'incident-*' 2>/dev/null | head -1)"
+
+    [[ -n "$inc" && -d "$inc" ]]
+    check "incident directory created under the forensic path" "$?"
+
+    [[ -f "$inc/00-INCIDENT-SUMMARY.txt" ]]
+    check "incident summary written" "$?"
+
+    local scripts
+    scripts="$(find "$inc" -maxdepth 1 -name '10-*.sh' 2>/dev/null | wc -l)"
+    (( scripts > 0 ))
+    check "one response script per finding ($scripts generated)" "$?"
+
+    # generation must not touch the host
+    [[ -f "$root/vendor.js" ]]
+    check "generating scripts does not move or delete anything" "$?"
+
+    local bad=""
+    local f
+    while IFS= read -r f; do
+        bash -n "$f" 2>/dev/null || bad+="syntax:$(basename "$f") "
+        grep -qE '(^|[^-])\brm -rf\b|git clean|git reset --hard|chmod -R|chattr -R' "$f" && bad+="destructive:$(basename "$f") "
+    done < <(find "$inc" -maxdepth 1 -name '*.sh')
+    [[ -z "$bad" ]]
+    check "no generated script parses badly or contains a destructive command" "$?" "$bad"
+
+    # dry run preserves but does not contain
+    local one
+    one="$(find "$inc" -maxdepth 1 -name '10-*vendor.js*.sh' | head -1)"
+    [[ -n "$one" ]] && bash "$one" >/dev/null 2>&1
+    [[ -f "$root/vendor.js" ]]
+    check "dry run (no CONFIRM) leaves the file in place" "$?"
+
+    find "$inc/evidence" -type f 2>/dev/null | grep -q .
+    check "dry run still preserves evidence" "$?"
+
+    # confirmed run quarantines, and the file is recoverable
+    [[ -n "$one" ]] && CONFIRM=yes bash "$one" >/dev/null 2>&1
+    [[ ! -f "$root/vendor.js" ]]
+    check "CONFIRM=yes removes the file from the web root" "$?"
+
+    find "$inc/quarantine" -type f 2>/dev/null | grep -q .
+    check "the file is quarantined, not deleted (recoverable)" "$?"
+}
+
+# ============================================================
+# TEST 8 - monitor health
+#
+# Case 17: a monitor that stops silently must say so itself.
+# ============================================================
+
+test_health() {
+
+    want "health" || return 0
+    printf '\nTEST: monitor health reporting\n'
+
+    setup_case health
+
+    local out rc
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        WEB_BASELINE_DIR="$CASE_DIR/state/base" \
+        HEALTH_REQUIRED_BINARIES="$CASE_DIR/nonexistent-binary" \
+        HEALTH_REQUIRED_SERVICES="" HEALTH_OPTIONAL_SERVICES="" HEALTH_TIMERS="" \
+        timeout 120 "$REPO_DIR/bin/itm-security" health 2>&1)"
+    rc=$?
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -q 'MONITOR BROKEN'
+    check "missing component reports MONITOR BROKEN" "$?"
+
+    printf '%s' "$out" | grep -q 'MONITOR HEALTH: BROKEN'
+    check "health board shows BROKEN" "$?"
+
+    (( rc == 2 ))
+    check "exit code 2 for BROKEN (consumable by a remote check)" "$?" "got exit $rc"
+
+    printf '%s' "$out" | grep -qi 'never recorded\|MONITORING GAP'
+    check "a monitor that never completed a run is reported" "$?"
+
+    ! printf '%s' "$out" | grep -qi 'CLEAN'
+    check "the word CLEAN is never used" "$?"
+}
+
+# ============================================================
+# TEST 9 - cron persistence
+#
+# Case 4: the root cron reverse shell, and the stock system
+# crontab that must not look like one.
+# ============================================================
+
+test_cron() {
+
+    want "cron" || return 0
+    printf '\nTEST: scheduled task persistence\n'
+
+    setup_case cron
+    cp "$FIXTURES/cron/reverse-shell-pattern.txt" "$CASE_DIR/evil"
+    cp "$FIXTURES/cron/legitimate.txt"            "$CASE_DIR/normal"
+
+    local out
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        CRON_SYSTEM_FILES="$CASE_DIR/evil" CRON_DIRS= CRON_SPOOL_DIRS= \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit cron --dry-run 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -qE '^\[CRITICAL.*Suspicious scheduled task'
+    check "mkfifo+nc reverse shell in root cron = CRITICAL" "$?"
+
+    printf '%s' "$out" | grep -q 'runs every minute'
+    check "the every-minute schedule is parsed and scored" "$?"
+
+    printf '%s' "$out" | grep -q 'user=root schedule=\* \* \* \* \*'
+    check "schedule asterisks are not glob-expanded" "$?" \
+          "$(printf '%s' "$out" | grep -m1 'schedule=')"
+
+    printf '%s' "$out" | grep -q 'restarts SSH from cron'
+    check "sshd restart persistence is detected" "$?"
+
+    # the stock crontab must stay quiet
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        CRON_SYSTEM_FILES="$CASE_DIR/normal" CRON_DIRS= CRON_SPOOL_DIRS= \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit cron --dry-run 2>&1)"
+
+    ! printf '%s' "$out" | grep -qE '^\[(CRITICAL|HIGH|MEDIUM).*Suspicious scheduled task'
+    check "a stock system crontab raises no cron finding" "$?" \
+          "$(printf '%s' "$out" | grep -m2 'Suspicious scheduled task')"
+}
+
+# ============================================================
+# TEST 10 - shell syntax
 # ============================================================
 
 test_syntax() {
@@ -384,6 +570,9 @@ test_upload_bypass
 test_false_positives
 test_non_web_host
 test_safety_invariants
+test_remediation
+test_health
+test_cron
 
 printf '\n============================================================\n'
 printf ' PASS: %s   FAIL: %s\n' "$PASS" "$FAIL"

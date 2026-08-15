@@ -63,15 +63,17 @@ source "$ITM_LIB_DIR/itm-audit-common.sh"
 # this host has a web application workload before touching the
 # filesystem. nginx runs before php/web/webshell because those
 # consume the document roots and FastCGI targets it discovers.
-ITM_ALL_MODULES="role process network pam systemd command ioc nginx apache php web webshell gambling seo integrity fail2ban"
+ITM_ALL_MODULES="role health process network pam systemd cron command ioc nginx apache php web webshell gambling seo integrity fail2ban"
 
 module_file() {
     case "$1" in
         role)     printf '%s' "audit_role.sh" ;;
+        health)   printf '%s' "audit_health.sh" ;;
         process)  printf '%s' "audit_process.sh" ;;
         network)  printf '%s' "audit_network.sh" ;;
         pam)      printf '%s' "audit_pam.sh" ;;
         systemd)  printf '%s' "audit_systemd.sh" ;;
+        cron)     printf '%s' "audit_cron.sh" ;;
         command)  printf '%s' "audit_command.sh" ;;
         ioc)      printf '%s' "audit_ioc.sh" ;;
         nginx)    printf '%s' "audit_nginx.sh" ;;
@@ -93,17 +95,22 @@ ITM Server Security Monitor - post-compromise audit
 
 Usage:
   itm-security audit [module ...] [options]
+  itm-security health | doctor
   itm-security web <baseline|changes|status|realtime>
+  itm-security remediate [module ...] [--min-severity SEV]
   itm-security self-test
   itm-security version
   itm-security help
 
 Modules:
   role        host role detection - decides which modules apply
+  health      is the MONITOR itself alive: services, timers, missed
+              runs, inotify capacity, self-integrity
   process     running process integrity, deleted and fileless executables
   network     listeners, exposure policy, root owned outbound sessions
   pam         PAM stack integrity, pam_exec credential capture
   systemd     malicious unit persistence
+  cron        reverse shells and downloaders in scheduled tasks
   command     wrapper binaries hiding processes, ports and files
   ioc         unpackaged binaries in system directories, known IOC
               paths/hashes/domains, ld.so.preload injection
@@ -127,6 +134,12 @@ Modules:
               OWNER_CHANGED, PERMISSION_CHANGED
 
   With no module named, every module runs.
+
+Incident response:
+  remediate      run an audit, then generate one evidence-first response
+                 script per finding under /root/forensic/incident-<time>/.
+                 Generating changes nothing. Each script preserves evidence
+                 and only contains the threat when re-run with CONFIRM=yes.
 
 Web subcommands:
   web baseline   (re)build the source integrity baseline
@@ -355,6 +368,41 @@ web_command() {
 }
 
 # ------------------------------------------------------------
+# Monitor health
+#
+# Exit codes are meaningful so a remote check can consume them:
+#   0 HEALTHY   1 DEGRADED   2 BROKEN
+# ------------------------------------------------------------
+
+health_command() {
+
+    local telegram=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --telegram) telegram=1 ;;
+            --quiet|-q) ITM_QUIET=1 ;;
+        esac
+    done
+
+    audit_load_config
+    audit_init_color
+    audit_detect_os
+    audit_detect_host
+
+    ITM_TELEGRAM="$telegram"
+    ITM_HEALTH_MODE=1
+
+    run_audit health
+    local rc=$?
+
+    case "${HEALTH_STATE:-HEALTHY}" in
+        BROKEN)   return 2 ;;
+        DEGRADED) return 1 ;;
+    esac
+    return 0
+}
+
+# ------------------------------------------------------------
 # Audit driver
 # ------------------------------------------------------------
 
@@ -398,6 +446,10 @@ run_audit() {
         # shellcheck disable=SC1090
         source "$ITM_MODULE_DIR/audit_role.sh"
     fi
+    if (( ${ITM_REMEDIATE:-0} )) && [[ -r "$ITM_LIB_DIR/itm-remediate.sh" ]]; then
+        # shellcheck disable=SC1090
+        source "$ITM_LIB_DIR/itm-remediate.sh"
+    fi
 
     # A signal handler that only cleans up would let the script
     # carry on with its temporary directory removed. Interrupt
@@ -434,7 +486,9 @@ run_audit() {
         "run_audit_$m"
     done
 
-    if [[ "${ITM_WEB_STATUS_MODE:-0}" == "1" ]]; then
+    if [[ "${ITM_HEALTH_MODE:-0}" == "1" ]]; then
+        health_board
+    elif [[ "${ITM_WEB_STATUS_MODE:-0}" == "1" ]]; then
         web_status_board
     else
         audit_summary
@@ -444,7 +498,25 @@ run_audit() {
     commit_seen_state
     telegram_dispatch
 
+    # Record completion so the health module can detect a
+    # monitoring gap. Written only on a real run.
+    if (( ITM_DRY_RUN == 0 )); then
+        scan_state_set "last-run:audit"
+        case " ${modules[*]} " in
+            *" webshell "*|*" gambling "*|*" seo "*|*" integrity "*)
+                scan_state_set "last-run:web" ;;
+        esac
+    fi
+
     audit_log INFO "audit end run_id=$ITM_RUN_ID max_severity=$ITM_MAX_SEV findings=$ITM_FINDING_TOTAL"
+
+    # Incident response pack. Generated from the findings of the
+    # run that just completed, never from a stale report: acting
+    # on a finding nobody re-verified is how production data gets
+    # destroyed.
+    if [[ "${ITM_REMEDIATE_MODE:-0}" == "1" ]]; then
+        rem_generate "${REMEDIATE_MIN_SEVERITY:-HIGH}"
+    fi
 
     if (( ITM_JSON_MODE )); then
         emit_json_array
@@ -486,6 +558,14 @@ main() {
             web_command "$@"
             return $?
             ;;
+        health|doctor)
+            health_command "$@"
+            return $?
+            ;;
+        remediate|incident-plan|recommend)
+            ITM_REMEDIATE=1
+            ITM_REMEDIATE_MODE=1
+            ;;
         *)
             say_err "[ERROR] Unknown command: $command"
             say_err "Run 'itm-security help' for usage."
@@ -505,6 +585,7 @@ main() {
             --min-severity)
                 shift || true
                 TELEGRAM_MIN_SEVERITY_OVERRIDE="${1:-HIGH}"
+                REMEDIATE_MIN_SEVERITY="${1:-HIGH}"
                 ;;
             --dry-run|--dryrun)
                 ITM_DRY_RUN=1

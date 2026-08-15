@@ -68,6 +68,12 @@ ITM_WRITE_LOG=1
 # instead of being buffered for an end-of-run summary.
 ITM_STANDALONE="${ITM_STANDALONE:-0}"
 
+# Remediation mode: collect actionable findings so that
+# "itm-security remediate" can generate an evidence-first
+# response script for each one. Collection only - generating a
+# script never changes anything on the host.
+ITM_REMEDIATE="${ITM_REMEDIATE:-0}"
+
 # ============================================================
 # DEFAULT POLICY
 #
@@ -871,6 +877,10 @@ ITM_MODULE_ORDER=()
 
 TG_SEV=(); TG_TITLE=(); TG_PATH=(); TG_EVIDENCE=(); TG_ACTION=(); TG_FP=(); TG_MODULE=(); TG_CONF=()
 
+# Remediation queue, populated when ITM_REMEDIATE=1.
+REM_SEV=(); REM_MODULE=(); REM_ID=(); REM_TITLE=(); REM_PATH=()
+REM_HASH=(); REM_ACTION=(); REM_REASONS=(); REM_FP=(); REM_CONF=()
+
 ITM_MAX_SEV="NONE"
 ITM_FINDING_TOTAL=0
 
@@ -1100,6 +1110,21 @@ add_finding() {
         (( ITM_WRITE_LOG )) && printf '%s\n' "$json_record" >> "$ITM_JSON_FILE" 2>/dev/null
     else
         printf '%s\n' "$json_record" >> "$ITM_RUN_TMP/findings.jsonl"
+    fi
+
+    # Remediation queue: anything an operator would have to act
+    # on. INFO and pass records are never actionable.
+    if (( ITM_REMEDIATE )) && (( snum >= 3 )); then
+        REM_SEV+=("$severity")
+        REM_MODULE+=("$CURRENT_MODULE")
+        REM_ID+=("${id:-$finding}")
+        REM_TITLE+=("$finding")
+        REM_PATH+=("$path")
+        REM_HASH+=("$filehash")
+        REM_ACTION+=("$action")
+        REM_REASONS+=("$reasons")
+        REM_FP+=("$fingerprint")
+        REM_CONF+=("$confidence")
     fi
 
     # Telegram queue.
