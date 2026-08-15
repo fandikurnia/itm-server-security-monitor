@@ -243,7 +243,7 @@ check_webshells() {
                 fi
             fi
 
-        done < <(web_enumerate "$root" code "$WEB_SCAN_SINCE")
+        done < <(web_enumerate_scan "$root" code "$WEB_SCAN_SINCE")
 
     done
 
@@ -560,7 +560,7 @@ run_audit_webshell() {
     web_load_iocs
 
     if ! web_scan_roots; then
-        add_skip "no web root resolved - set WEB_ROOTS in ${ITM_AUDIT_CONF}"
+        web_report_no_roots "Webshell scan"
         module_end
         return 0
     fi

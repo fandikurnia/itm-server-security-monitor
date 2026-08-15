@@ -1,0 +1,7 @@
+<?php
+// FIXTURE - inert. Reproduces the cloaking control flow only.
+if (preg_match('/googlebot|bingbot|sogou/i', $_SERVER['HTTP_USER_AGENT'])) {
+    readfile(__DIR__ . '/vendor.js');
+    exit;
+}
+?><html><head><title>Satu Data Kemenpora</title></head><body>Portal Resmi</body></html>

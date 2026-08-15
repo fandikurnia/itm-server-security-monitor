@@ -1,0 +1,3 @@
+# FIXTURE - reproduces the real upload directory bypass
+AddType application/x-httpd-php .pdf
+AddHandler application/x-httpd-php .jpg

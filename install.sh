@@ -57,6 +57,7 @@ AUDIT_MODULES=(
     audit_command.sh
     audit_ioc.sh
     audit_nginx.sh
+    audit_apache.sh
     audit_php.sh
     audit_web.sh
     audit_webshell.sh
