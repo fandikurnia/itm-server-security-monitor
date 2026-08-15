@@ -50,10 +50,12 @@ WEB_EVIDENCE_DIR="/var/lib/itm-security/evidence"
 
 AUDIT_MODULES=(
     audit_role.sh
+    audit_health.sh
     audit_process.sh
     audit_network.sh
     audit_pam.sh
     audit_systemd.sh
+    audit_cron.sh
     audit_command.sh
     audit_ioc.sh
     audit_nginx.sh
@@ -106,6 +108,7 @@ REQUIRED_FILES=(
     "$SCRIPT_DIR/systemd/itm-security-audit.timer"
     "$SCRIPT_DIR/logrotate/itm-security"
     "$SCRIPT_DIR/lib/itm-web-common.sh"
+    "$SCRIPT_DIR/lib/itm-remediate.sh"
     "$SCRIPT_DIR/bin/itm-web-realtime"
     "$SCRIPT_DIR/systemd/itm-web-scan.service"
     "$SCRIPT_DIR/systemd/itm-web-scan.timer"
@@ -396,7 +399,8 @@ install \
     -o root \
     -g root \
     -m 0600 \
-    "$SCRIPT_DIR/lib/itm-web-common.sh" \
+    "$SCRIPT_DIR/lib/itm-web-common.sh"
+    "$SCRIPT_DIR/lib/itm-remediate.sh" \
     "$AUDIT_LIB_DIR/itm-web-common.sh"
 
 install \
@@ -1109,6 +1113,7 @@ echo "  itm-security audit"
 echo "  itm-security audit nginx web     # single modules"
 echo "  itm-security audit --json | jq ."
 echo
+echo "  itm-security remediate            # generate response scripts in /root/forensic"
 echo "  itm-security web status"
 echo "  itm-security web baseline        # after a verified clean deployment"
 echo "  systemctl status itm-web-realtime --no-pager"
