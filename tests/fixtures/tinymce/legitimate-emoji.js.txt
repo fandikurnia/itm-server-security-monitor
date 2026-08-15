@@ -1,0 +1,3 @@
+tinymce.Resource.add('tinymce.plugins.emoticons', {
+ "slot_machine":{keywords:["slot","machine","casino","gamble"],char:"\u{1F3B0}",category:"activities"},
+ "game_die":{keywords:["dice","gamble","game"],char:"\u{1F3B2}",category:"activities"}});

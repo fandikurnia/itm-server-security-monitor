@@ -166,7 +166,7 @@ check_gambling_content() {
                 audit_log INFO "gambling terms in $file: $(printf '%s' "$hits" | tr '\n' ' ')"
             fi
 
-        done < <(web_enumerate "$root" both "$WEB_SCAN_SINCE")
+        done < <(web_enumerate_scan "$root" both "$WEB_SCAN_SINCE")
 
     done
 
@@ -239,7 +239,7 @@ run_audit_gambling() {
     fi
 
     if ! web_scan_roots; then
-        add_skip "no web root resolved - set WEB_ROOTS in ${ITM_AUDIT_CONF}"
+        web_report_no_roots "Gambling injection scan"
         module_end
         return 0
     fi

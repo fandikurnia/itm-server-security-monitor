@@ -1,0 +1,2 @@
+; FIXTURE - reproduces PHP auto_prepend persistence
+auto_prepend_file="/var/tmp/prep.inc"

@@ -309,7 +309,7 @@ run_audit_integrity() {
     web_load_iocs
 
     if ! web_scan_roots; then
-        add_skip "no web root resolved - set WEB_ROOTS in ${ITM_AUDIT_CONF}"
+        web_report_no_roots "Source integrity baseline"
         module_end
         return 0
     fi

@@ -29,8 +29,15 @@ ITM_WEB_COMMON_LOADED=1
 WEB_MAX_FILE_BYTES="${WEB_MAX_FILE_BYTES:-2097152}"
 
 # Content types worth reading.
-WEB_CODE_EXT="${WEB_CODE_EXT:-php phtml phar php3 php4 php5 php7 php8 pht phps inc}"
-WEB_MARKUP_EXT="${WEB_MARKUP_EXT:-html htm js json xml txt}"
+# Extensions are matched CASE INSENSITIVELY (-iname). A real
+# upload directory on this estate contained x.Phar and x.PHP
+# alongside x.phtml: case-sensitive matching let two of them
+# through untouched.
+#
+# php~ and php_ are editor/backup artefacts that many PHP
+# handlers still execute, and .phtm/.pht are handler aliases.
+WEB_CODE_EXT="${WEB_CODE_EXT:-php phtml phtm phar php3 php4 php5 php6 php7 php8 pht phps inc phpt php~ php_}"
+WEB_MARKUP_EXT="${WEB_MARKUP_EXT:-html htm js mjs json xml txt css}"
 
 # A file newer than this is "recent" for scoring purposes.
 WEB_NEW_FILE_HOURS="${WEB_NEW_FILE_HOURS:-72}"
@@ -96,48 +103,166 @@ web_path_excluded() {
 # ------------------------------------------------------------
 # Web roots
 #
-# Discovered from the Nginx effective configuration plus
-# WEB_ROOTS from audit.conf. Only called after the role module
-# has confirmed a web application workload.
+# Unified discovery across every supported web server.
+#
+# This function is the reason the Satudata incident produced no
+# alert. The previous implementation asked Nginx and only Nginx,
+# so on an Apache host it returned nothing, every content module
+# skipped, and the skip was logged at INFO - below the Telegram
+# threshold. The monitor was blind and silent at the same time.
+#
+# Sources, in order of authority:
+#   1. WEB_ROOTS in audit.conf          (operator override)
+#   2. roots discovered this run        (nginx/apache modules)
+#   3. live web server configuration    (nginx -T, apache config)
+#   4. conventional locations that exist AND hold content
+#
+# Each root records where it came from, so the report can say
+# what the scan was actually based on.
 # ------------------------------------------------------------
 
 WEB_SCAN_ROOTS=()
+declare -A WEB_ROOT_SOURCE=()
 
-web_scan_roots() {
+# --- Nginx -----------------------------------------------------
+
+web_nginx_roots() {
+    have_cmd nginx || return 0
+    run_timeout "$CMD_TIMEOUT" nginx -T 2>/dev/null \
+        | awk '/^[[:space:]]*root[[:space:]]/ {
+                 v = $2; gsub(/[;"'"'"']/, "", v); if (v != "") print v
+               }' | sort -u
+}
+
+# --- Apache ----------------------------------------------------
+#
+# apache2ctl -S reports vhosts and the config file each was
+# defined in, but not the DocumentRoot. The roots therefore come
+# from the configuration files themselves, which also works when
+# apache2ctl is unavailable or refuses to run.
+# ---------------------------------------------------------------
+
+APACHE_CONF_DIRS="${APACHE_CONF_DIRS:-/etc/apache2 /etc/httpd /usr/local/apache2/conf /etc/apache2/sites-enabled /etc/httpd/conf.d}"
+
+web_apache_ctl() {
+    local ctl
+    for ctl in apache2ctl apachectl httpd; do
+        have_cmd "$ctl" && { printf '%s' "$ctl"; return 0; }
+    done
+    return 1
+}
+
+web_apache_config_files() {
+    local dir
+    for dir in $APACHE_CONF_DIRS; do
+        [[ -d "$dir" ]] || continue
+        run_scan 30 find "$dir" -maxdepth 3 -type f \
+            \( -name '*.conf' -o -name 'httpd.conf' -o -name 'apache2.conf' \) \
+            -print 2>/dev/null
+    done | sort -u
+}
+
+web_apache_roots() {
+
+    local file
+
+    # Only enabled vhosts matter, but sites-available is included
+    # when nothing is enabled, so a misconfigured host still gets
+    # its roots reported rather than silently skipped.
+    while IFS= read -r file; do
+        [[ -r "$file" ]] || continue
+        awk '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*DocumentRoot[[:space:]]/ {
+                v = $2
+                gsub(/["'"'"']/, "", v)
+                sub(/\/+$/, "", v)
+                if (v != "") print v
+            }
+        ' "$file" 2>/dev/null
+    done < <(web_apache_config_files) | sort -u
+}
+
+# --- Conventional locations ------------------------------------
+
+WEB_DEFAULT_ROOT_CANDIDATES="${WEB_DEFAULT_ROOT_CANDIDATES:-/var/www/html /var/www /website /usr/share/nginx/html /srv/www /home/www /opt/www}"
+
+# A default location only counts when it actually holds content:
+# an empty /var/www on a database server is not a web root.
+web_default_roots() {
+    local root
+    for root in $WEB_DEFAULT_ROOT_CANDIDATES; do
+        [[ -d "$root" ]] || continue
+        run_scan 15 find "$root" -maxdepth 2 -type f \
+            \( -iname '*.php' -o -iname '*.html' -o -iname '*.htm' -o -iname 'index.*' \) \
+            -print -quit 2>/dev/null | grep -q . && printf '%s\n' "$root"
+    done
+}
+
+# --- Orchestration ---------------------------------------------
+
+web_discover_roots() {
 
     (( ${#WEB_SCAN_ROOTS[@]} > 0 )) && return 0
 
-    local candidates=() root seen covered
+    local root seen covered source
+    local -a candidates=() sources=()
 
+    add_candidate() {
+        [[ -n "$1" ]] || return 0
+        candidates+=("$1")
+        sources+=("$2")
+    }
+
+    # 1. operator configuration
     for root in $WEB_ROOTS; do
-        candidates+=("$root")
+        add_candidate "$root" "audit.conf:WEB_ROOTS"
     done
 
-    # Roots the nginx module already discovered this run, or the
-    # cached copy from a previous run.
+    # 2. roots discovered earlier in this run, or cached
     local cache
     for cache in "$ITM_RUN_TMP/nginx-roots.list" "$ITM_NGINX_ROOT_CACHE"; do
         [[ -r "$cache" ]] || continue
         while IFS= read -r root; do
-            [[ -n "$root" ]] && candidates+=("$root")
+            add_candidate "$root" "nginx"
         done < "$cache"
         break
     done
 
-    # Nothing cached: ask nginx directly, still without touching
-    # the filesystem.
-    if (( ${#candidates[@]} == 0 )) && have_cmd nginx; then
+    for cache in "$ITM_RUN_TMP/apache-roots.list" "$ITM_APACHE_ROOT_CACHE"; do
+        [[ -r "$cache" ]] || continue
         while IFS= read -r root; do
-            [[ -n "$root" ]] && candidates+=("$root")
-        done < <(run_timeout "$CMD_TIMEOUT" nginx -T 2>/dev/null \
-                    | awk '/^[[:space:]]*root[[:space:]]/ {
-                             v = $2; gsub(/[;"'"'"']/, "", v); if (v != "") print v
-                           }' | sort -u)
-    fi
+            add_candidate "$root" "apache"
+        done < "$cache"
+        break
+    done
 
-    for root in ${candidates[@]+"${candidates[@]}"}; do
+    # 3. ask the web servers directly
+    while IFS= read -r root; do
+        add_candidate "$root" "nginx -T"
+    done < <(web_nginx_roots)
+
+    while IFS= read -r root; do
+        add_candidate "$root" "apache config"
+    done < <(web_apache_roots)
+
+    # 4. conventional locations holding content
+    while IFS= read -r root; do
+        add_candidate "$root" "conventional location"
+    done < <(web_default_roots)
+
+    local i
+    for (( i = 0; i < ${#candidates[@]}; i++ )); do
+
+        root="${candidates[$i]}"
+        source="${sources[$i]}"
 
         [[ -d "$root" ]] || continue
+
+        # Refuse roots that would scan the whole filesystem.
+        case "$root" in
+            /|/usr|/etc|/var|/home|/opt|/srv) continue ;;
+        esac
 
         covered=0
         for seen in ${WEB_SCAN_ROOTS[@]+"${WEB_SCAN_ROOTS[@]}"}; do
@@ -146,9 +271,46 @@ web_scan_roots() {
         (( covered )) && continue
 
         WEB_SCAN_ROOTS+=("$root")
+        WEB_ROOT_SOURCE["$root"]="$source"
     done
 
     (( ${#WEB_SCAN_ROOTS[@]} > 0 ))
+}
+
+# Backwards compatible name used by the existing modules.
+web_scan_roots() { web_discover_roots; }
+
+web_roots_provenance() {
+    local root out=""
+    for root in ${WEB_SCAN_ROOTS[@]+"${WEB_SCAN_ROOTS[@]}"}; do
+        out+="${out:+, }${root} (via ${WEB_ROOT_SOURCE[$root]:-unknown})"
+    done
+    printf '%s' "$out"
+}
+
+# ------------------------------------------------------------
+# No roots on a host that serves web content is a MONITORING
+# FAILURE, not an informational note.
+#
+# Reporting it at INFO is what kept the Satudata host quiet: the
+# scan found nothing because it looked nowhere, and nothing below
+# HIGH ever reaches Telegram.
+# ------------------------------------------------------------
+
+web_report_no_roots() {
+
+    local module_label="$1"
+
+    add_finding HIGH \
+        "MONITORING DEGRADED: ${module_label} has no web root to scan" \
+        id="web-no-roots:${CURRENT_MODULE}" \
+        confidence=99 \
+        reasons="This host is classified as running a web application
+No document root could be discovered from Nginx, Apache, or the conventional locations
+The scan therefore examined NOTHING - this is not a clean result" \
+        evidence="Discovery sources tried: audit.conf WEB_ROOTS, nginx -T, Apache configuration ($APACHE_CONF_DIRS), conventional locations.
+Web server detected by role module: ${ROLE_WEB_SERVER:-unknown}" \
+        action="Set WEB_ROOTS in ${ITM_AUDIT_CONF} to the document root(s) of this host, then re-run: itm-security audit webshell gambling seo. Until then the web content modules are blind on this server."
 }
 
 # ------------------------------------------------------------
@@ -184,15 +346,15 @@ web_enumerate() {
     case "$mode" in
         code)   for ext in $WEB_CODE_EXT; do
                     (( first )) || name_args+=( -o )
-                    name_args+=( -name "*.$ext" ); first=0
+                    name_args+=( -iname "*.$ext" ); first=0
                 done ;;
         markup) for ext in $WEB_MARKUP_EXT; do
                     (( first )) || name_args+=( -o )
-                    name_args+=( -name "*.$ext" ); first=0
+                    name_args+=( -iname "*.$ext" ); first=0
                 done ;;
         both)   for ext in $WEB_CODE_EXT $WEB_MARKUP_EXT; do
                     (( first )) || name_args+=( -o )
-                    name_args+=( -name "*.$ext" ); first=0
+                    name_args+=( -iname "*.$ext" ); first=0
                 done ;;
         all)    name_args=( -true ) ;;
     esac
@@ -209,6 +371,58 @@ web_enumerate() {
         ${time_args[@]+"${time_args[@]}"} \
         -size -"$(( WEB_MAX_FILE_BYTES / 1024 + 1 ))"k \
         -print 2>/dev/null
+}
+
+# ------------------------------------------------------------
+# Files that must be examined on EVERY run
+#
+# The incremental window makes routine scans cheap, but a
+# handful of files decide whether a site is poisoned and must
+# never be skipped because their mtime is older than the last
+# scan:
+#
+#   index.php  vendor.js  robots.txt  sitemap.xml
+#   .htaccess  .user.ini
+#
+# The Satudata payload was exactly this shape: a top level
+# vendor.js and an edited index.php.
+# ------------------------------------------------------------
+
+WEB_ALWAYS_CHECK="${WEB_ALWAYS_CHECK:-index.php index.html vendor.js app.js main.js bundle.js robots.txt sitemap.xml sitemap_index.xml .htaccess .user.ini .env}"
+
+web_enumerate_always() {
+
+    local root="$1" name
+
+    # Top level of the root, plus one level down for the common
+    # public/ layout.
+    for name in $WEB_ALWAYS_CHECK; do
+        [[ -f "$root/$name" ]]         && printf '%s\n' "$root/$name"
+        [[ -f "$root/public/$name" ]]  && printf '%s\n' "$root/public/$name"
+    done
+
+    # Any file sitting at the very top of a document root is
+    # worth looking at regardless of its name or extension: that
+    # is where a dropped payload has to live to be reachable.
+    run_scan 20 find "$root" -maxdepth 1 -type f \
+        -size -"$(( WEB_MAX_FILE_BYTES / 1024 + 1 ))"k -print 2>/dev/null
+}
+
+# ------------------------------------------------------------
+# The enumeration every content module should use.
+#
+# Incremental window PLUS the always-check set, deduplicated.
+# A file whose mtime predates the last scan is still examined
+# when it is one of the files that decides whether the site is
+# poisoned.
+# ------------------------------------------------------------
+
+web_enumerate_scan() {
+    local root="$1" mode="${2:-both}" since="${3:-0}"
+    {
+        web_enumerate "$root" "$mode" "$since"
+        web_enumerate_always "$root"
+    } | awk '!seen[$0]++'
 }
 
 # Directories that hold uploaded or static content.

@@ -209,7 +209,7 @@ check_seo_poisoning() {
                 "Do not edit the file before capturing it. Check the same directory for sibling doorway pages, review the CMS for unauthorised accounts and plugins, then restore the file from a known good release. After cleanup, request re-indexing so the poisoned entries are dropped." \
                 && reported=$(( reported + 1 ))
 
-        done < <(web_enumerate "$root" both "$WEB_SCAN_SINCE")
+        done < <(web_enumerate_scan "$root" both "$WEB_SCAN_SINCE")
 
     done
 
@@ -290,7 +290,7 @@ run_audit_seo() {
     GAMBLING_REGEX="${GAMBLING_REGEX:-$(ioc_build_regex GAMBLING_KEYWORDS)}"
 
     if ! web_scan_roots; then
-        add_skip "no web root resolved - set WEB_ROOTS in ${ITM_AUDIT_CONF}"
+        web_report_no_roots "SEO poisoning scan"
         module_end
         return 0
     fi

@@ -10,7 +10,7 @@ Type=oneshot
 # Role aware: on a host with no web application workload this
 # exits immediately after the lightweight classification, having
 # touched no filesystem.
-ExecStart=/usr/local/sbin/itm-security audit role webshell gambling seo integrity nginx --telegram
+ExecStart=/usr/local/sbin/itm-security audit role webshell gambling seo integrity nginx apache --telegram
 
 User=root
 Group=root

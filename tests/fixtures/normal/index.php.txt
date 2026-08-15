@@ -1,0 +1,4 @@
+<?php
+$title = 'Portal Resmi';
+require __DIR__ . '/inc/header.php';
+echo '<h1>' . htmlspecialchars($title) . '</h1>';

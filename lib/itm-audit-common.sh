@@ -47,6 +47,7 @@ ITM_STATE_DIR="${ITM_STATE_DIR:-/var/lib/itm-security/audit-state}"
 ITM_ALERT_DB="$ITM_STATE_DIR/alerted.db"
 ITM_SEEN_DB="$ITM_STATE_DIR/findings.db"
 ITM_NGINX_ROOT_CACHE="$ITM_STATE_DIR/nginx-roots.list"
+ITM_APACHE_ROOT_CACHE="$ITM_STATE_DIR/apache-roots.list"
 
 ITM_NOTIFY_BIN="${ITM_NOTIFY_BIN:-/usr/local/sbin/security-notify}"
 
@@ -77,26 +78,26 @@ ITM_STANDALONE="${ITM_STANDALONE:-0}"
 # Host trust is an operator decision, never a scanner decision.
 # A host that was once root compromised stays UNTRUSTED until
 # it is rebuilt from trusted media.
-HOST_TRUST_STATUS="UNVERIFIED"
-HOST_TRUST_REASON=""
+HOST_TRUST_STATUS="${HOST_TRUST_STATUS:-UNVERIFIED}"
+HOST_TRUST_REASON="${HOST_TRUST_REASON:-}"
 
-TELEGRAM_MIN_SEVERITY="HIGH"
-TELEGRAM_MAX_ALERTS=10
-ALERT_REPEAT_HOURS=24
-ALERT_STATE_RETENTION_DAYS=30
+TELEGRAM_MIN_SEVERITY="${TELEGRAM_MIN_SEVERITY:-HIGH}"
+TELEGRAM_MAX_ALERTS="${TELEGRAM_MAX_ALERTS:-10}"
+ALERT_REPEAT_HOURS="${ALERT_REPEAT_HOURS:-24}"
+ALERT_STATE_RETENTION_DAYS="${ALERT_STATE_RETENTION_DAYS:-30}"
 
-CMD_TIMEOUT=20
-FIND_TIMEOUT=120
+CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
+FIND_TIMEOUT="${FIND_TIMEOUT:-120}"
 
 # Directories whose contents must never be executed as PHP.
-UPLOAD_DIR_PATTERN='(data|upload|uploads|file|files|image|images|img|media|storage|attachment|attachments|berkas|dokumen|foto|galeri)'
+[[ -n "${UPLOAD_DIR_PATTERN:-}" ]] || UPLOAD_DIR_PATTERN='(data|upload|uploads|file|files|image|images|img|media|storage|attachment|attachments|berkas|dokumen|foto|galeri)'
 
-WEB_ROOTS=""
-WEB_SCAN_MAXDEPTH=10
-WEB_RECENT_DAYS=7
-WEB_EXCLUDE_DIRS="node_modules .git .svn .hg cache caches sessions session tmp temp logs log backup backups"
-WEB_EXCLUDE_VENDOR=1
-WEB_MAX_REPORTED=25
+WEB_ROOTS="${WEB_ROOTS:-}"
+WEB_SCAN_MAXDEPTH="${WEB_SCAN_MAXDEPTH:-10}"
+WEB_RECENT_DAYS="${WEB_RECENT_DAYS:-7}"
+WEB_EXCLUDE_DIRS="${WEB_EXCLUDE_DIRS:-node_modules .git .svn .hg cache caches sessions session tmp temp logs log backup backups}"
+WEB_EXCLUDE_VENDOR="${WEB_EXCLUDE_VENDOR:-1}"
+WEB_MAX_REPORTED="${WEB_MAX_REPORTED:-25}"
 
 # Listener policy. Ports outside this list are reported for
 # review, not automatically treated as malicious.
@@ -113,10 +114,10 @@ ITM_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-sec
 ITM_OWN_BINARIES="/usr/local/sbin/security-notify /usr/local/sbin/ssh-login-alert /usr/local/sbin/security-file-monitor /usr/local/sbin/itm-command-relay /usr/local/sbin/itm-security /usr/local/sbin/itm-web-realtime"
 
 # Units seen in real incidents on this estate.
-KNOWN_BAD_UNITS="defaults.service server-security.service"
+KNOWN_BAD_UNITS="${KNOWN_BAD_UNITS:-defaults.service server-security.service}"
 
-SYSTEMD_RECENT_DAYS=30
-PHP_MIN_SUPPORTED="8.1"
+SYSTEMD_RECENT_DAYS="${SYSTEMD_RECENT_DAYS:-30}"
+PHP_MIN_SUPPORTED="${PHP_MIN_SUPPORTED:-8.1}"
 
 # Paths no legitimate long running service should execute from.
 # Home directories are handled separately: a user running a

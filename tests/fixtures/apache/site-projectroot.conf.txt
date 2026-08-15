@@ -1,0 +1,8 @@
+<VirtualHost *:80>
+    ServerName portal.example.invalid
+    DocumentRoot __ROOT__
+    <Directory __ROOT__>
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>

@@ -63,7 +63,7 @@ source "$ITM_LIB_DIR/itm-audit-common.sh"
 # this host has a web application workload before touching the
 # filesystem. nginx runs before php/web/webshell because those
 # consume the document roots and FastCGI targets it discovers.
-ITM_ALL_MODULES="role process network pam systemd command ioc nginx php web webshell gambling seo integrity fail2ban"
+ITM_ALL_MODULES="role process network pam systemd command ioc nginx apache php web webshell gambling seo integrity fail2ban"
 
 module_file() {
     case "$1" in
@@ -75,6 +75,7 @@ module_file() {
         command)  printf '%s' "audit_command.sh" ;;
         ioc)      printf '%s' "audit_ioc.sh" ;;
         nginx)    printf '%s' "audit_nginx.sh" ;;
+        apache)   printf '%s' "audit_apache.sh" ;;
         php)      printf '%s' "audit_php.sh" ;;
         web)      printf '%s' "audit_web.sh" ;;
         webshell) printf '%s' "audit_webshell.sh" ;;
@@ -107,6 +108,8 @@ Modules:
   ioc         unpackaged binaries in system directories, known IOC
               paths/hashes/domains, ld.so.preload injection
   nginx       PHP execution in upload/data document roots
+  apache      DocumentRoot exposure, .htaccess/.user.ini handlers,
+              AllowOverride, CGI, mod_remoteip real client IP
   php         PHP-FPM versions, pools and production settings
   web         web filesystem: webshells, artefacts, permissions
   fail2ban    service, jail, backend and SSH port coverage
@@ -339,7 +342,7 @@ web_command() {
 
         status)
             ITM_WEB_STATUS_MODE=1
-            run_audit role nginx php webshell gambling seo integrity
+            run_audit role nginx apache php webshell gambling seo integrity
             return $?
             ;;
 
