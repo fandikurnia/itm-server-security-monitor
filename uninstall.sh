@@ -31,6 +31,37 @@ chmod 700 "$BACKUP_DIR"
 echo "[+] Backups: $BACKUP_DIR"
 
 # ------------------------------------------------------------
+# Announce the uninstall BEFORE removing the notifier.
+#
+# Removing the monitoring is exactly what an intruder does after
+# they find it, so the removal is reported on the same channel
+# as everything else - while the channel still exists.
+# ------------------------------------------------------------
+
+if [[ -x /usr/local/sbin/security-notify ]]; then
+    OPERATOR="${SUDO_USER:-$(id -un 2>/dev/null)}"
+    FROM="${SSH_CONNECTION:-}"
+    FROM="${FROM%% *}"
+    [[ -n "$FROM" ]] || FROM="local session (not proof of console access)"
+
+    /usr/local/sbin/security-notify "⚠️ SECURITY MONITOR BEING UNINSTALLED
+
+Operator : ${OPERATOR}
+Source   : ${FROM}
+Mode     : $( (( PURGE )) && echo "--purge (config, state and logs removed)" || echo "standard (config and logs kept)" )
+Backups  : ${BACKUP_DIR}
+
+After this completes, THIS HOST IS NO LONGER MONITORED.
+File changes, SSH logins, command execution and scheduled audits
+stop being reported. No further alert will arrive from this server.
+
+If you did not start this, treat it as an intrusion in progress." \
+        >/dev/null 2>&1 || true
+
+    echo "[+] Uninstall announced to Telegram."
+fi
+
+# ------------------------------------------------------------
 # Remove a block the installer appended, identified by its
 # marker comment, after backing the file up.
 # ------------------------------------------------------------
@@ -114,6 +145,8 @@ remove_marker_block /root/.bashrc    "# ITM Server Security Monitor - root comma
 # ------------------------------------------------------------
 # Scripts, library and modules
 # ------------------------------------------------------------
+
+cp -a /usr/local/sbin/security-notify "$BACKUP_DIR/" 2>/dev/null || true
 
 rm -f \
     /usr/local/sbin/security-notify \
@@ -202,6 +235,26 @@ else
     echo
     echo "    Remove them with: bash uninstall.sh --purge"
 
+fi
+
+# Final notice, sent from the backup copy while it still exists.
+if [[ -x "$BACKUP_DIR/security-notify" ]] || command -v curl >/dev/null 2>&1; then
+    if [[ -r /etc/security-monitor/telegram.conf ]]; then
+        # shellcheck disable=SC1091
+        . /etc/security-monitor/telegram.conf 2>/dev/null || true
+        if [[ -n "${BOT_TOKEN:-}" && -n "${CHAT_ID:-}" ]]; then
+            curl -fsS --max-time 10 -X POST \
+                "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                -d "chat_id=${CHAT_ID}" \
+                --data-urlencode "text=🔕 SECURITY MONITOR REMOVED
+
+Host    : $(hostname -f 2>/dev/null || hostname)
+Time    : $(date '+%Y-%m-%d %H:%M:%S %Z')
+
+Monitoring has stopped on this host. This is the last message
+you will receive from it." >/dev/null 2>&1 || true
+        fi
+    fi
 fi
 
 echo

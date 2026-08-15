@@ -96,6 +96,7 @@ ITM Server Security Monitor - post-compromise audit
 Usage:
   itm-security audit [module ...] [options]
   itm-security health | doctor
+  itm-security heartbeat
   itm-security web <baseline|changes|status|realtime>
   itm-security remediate [module ...] [--min-severity SEV]
   itm-security self-test
@@ -561,6 +562,30 @@ main() {
         health|doctor)
             health_command "$@"
             return $?
+            ;;
+        heartbeat)
+            # A periodic "still alive" message. Silence is the
+            # signal: a remote checker (Zabbix, uptime monitor,
+            # a second server) watches for the ABSENCE of this,
+            # which is the only way to detect a monitor that was
+            # removed rather than one that failed.
+            audit_load_config
+            audit_detect_os
+            audit_detect_host
+            if [[ -x "$ITM_NOTIFY_BIN" ]]; then
+                "$ITM_NOTIFY_BIN" "💓 MONITOR HEARTBEAT
+
+Version : ${ITM_AUDIT_VERSION}
+Status  : monitoring active
+Time    : $(date '+%Y-%m-%d %H:%M:%S %Z')
+
+Absence of this message is itself an alert." >/dev/null 2>&1 \
+                    && { printf 'heartbeat sent\n'; return 0; }
+                printf 'heartbeat FAILED to send\n' >&2
+                return 1
+            fi
+            printf 'notifier not installed\n' >&2
+            return 1
             ;;
         remediate|incident-plan|recommend)
             ITM_REMEDIATE=1

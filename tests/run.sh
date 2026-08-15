@@ -434,13 +434,52 @@ test_remediation() {
     find "$inc/evidence" -type f 2>/dev/null | grep -q .
     check "dry run still preserves evidence" "$?"
 
+    # CONFIRM alone must not be enough without a terminal
+    [[ -n "$one" ]] && CONFIRM=yes bash "$one" </dev/null >/dev/null 2>&1
+    [[ -f "$root/vendor.js" ]]
+    check "CONFIRM=yes without a terminal aborts (no accidental containment)" "$?"
+
     # confirmed run quarantines, and the file is recoverable
-    [[ -n "$one" ]] && CONFIRM=yes bash "$one" >/dev/null 2>&1
+    [[ -n "$one" ]] && CONFIRM=yes FORCE=yes bash "$one" </dev/null >/dev/null 2>&1
     [[ ! -f "$root/vendor.js" ]]
     check "CONFIRM=yes removes the file from the web root" "$?"
 
     find "$inc/quarantine" -type f 2>/dev/null | grep -q .
     check "the file is quarantined, not deleted (recoverable)" "$?"
+
+    grep -q 'REMEDIATION APPLIED' "$one"
+    check "containment announces itself to Telegram" "$?"
+
+    grep -q 'Type CONTAIN to proceed' "$one"
+    check "a typed confirmation is required, not just an env var" "$?"
+}
+
+# ============================================================
+# TEST: the monitor reports its own removal
+# ============================================================
+
+test_self_protection() {
+
+    want "self-protection" || return 0
+    printf '\nTEST: monitor self-protection\n'
+
+    grep -q '/usr/local/sbin/itm-security' "$REPO_DIR/bin/security-file-monitor"
+    check "the file monitor watches the monitor's own binaries" "$?"
+
+    grep -q '/etc/security-monitor' "$REPO_DIR/bin/security-file-monitor"
+    check "the file monitor watches the monitor's configuration" "$?"
+
+    grep -q 'SECURITY MONITOR MODIFIED' "$REPO_DIR/bin/security-file-monitor"
+    check "modification of the monitor is its own CRITICAL severity" "$?"
+
+    grep -q 'SECURITY MONITOR BEING UNINSTALLED' "$REPO_DIR/uninstall.sh"
+    check "uninstall announces itself before removing the notifier" "$?"
+
+    grep -q 'SECURITY MONITOR REMOVED' "$REPO_DIR/uninstall.sh"
+    check "uninstall sends a final message after removal" "$?"
+
+    grep -q 'heartbeat)' "$REPO_DIR/bin/itm-security"
+    check "a heartbeat command exists so silence can be detected remotely" "$?"
 }
 
 # ============================================================
@@ -573,6 +612,7 @@ test_safety_invariants
 test_remediation
 test_health
 test_cron
+test_self_protection
 
 printf '\n============================================================\n'
 printf ' PASS: %s   FAIL: %s\n' "$PASS" "$FAIL"
