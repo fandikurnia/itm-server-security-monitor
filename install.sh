@@ -401,9 +401,15 @@ install \
     -o root \
     -g root \
     -m 0600 \
-    "$SCRIPT_DIR/lib/itm-web-common.sh"
-    "$SCRIPT_DIR/lib/itm-remediate.sh" \
+    "$SCRIPT_DIR/lib/itm-web-common.sh" \
     "$AUDIT_LIB_DIR/itm-web-common.sh"
+
+install \
+    -o root \
+    -g root \
+    -m 0600 \
+    "$SCRIPT_DIR/lib/itm-remediate.sh" \
+    "$AUDIT_LIB_DIR/itm-remediate.sh"
 
 install \
     -o root \

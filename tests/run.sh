@@ -455,6 +455,59 @@ test_remediation() {
 }
 
 # ============================================================
+# TEST: installer well-formedness
+#
+# bash -n accepts an install(1) call with a source but no
+# destination - it is valid syntax and a broken command. That
+# exact mistake aborted a production upgrade mid-run, so it is
+# checked statically here.
+# ============================================================
+
+test_installer() {
+
+    want "installer" || return 0
+    printf '\nTEST: installer well-formedness\n'
+
+    local bad
+    bad="$(awk '
+      /^install \\$/ { inblk=1; blk=""; line=NR }
+      inblk {
+        blk = blk " " $0
+        if ($0 !~ /\\$/) {
+          inblk=0
+          isdir = (blk ~ /-d /)
+          gsub(/install|\\|-o root|-g root|-m [0-7]+|-d/, "", blk)
+          n=split(blk, a, /[[:space:]]+/); c=0
+          for(i=1;i<=n;i++) if(a[i] != "") c++
+          if (!isdir && c < 2) printf "line %s has %d argument(s)\n", line, c
+        }
+      }
+    ' "$REPO_DIR/install.sh")"
+
+    [[ -z "$bad" ]]
+    check "every install(1) call has a destination" "$?" "$bad"
+
+    # Every module the CLI knows about must be installed.
+    local m missing=""
+    for m in $(grep -m1 '^ITM_ALL_MODULES=' "$REPO_DIR/bin/itm-security" | cut -d'"' -f2); do
+        local f
+        f="$(grep -A1 "        ${m})" "$REPO_DIR/bin/itm-security" | grep -oE "audit_[a-z_]+\.sh" | head -1)"
+        [[ -n "$f" ]] || continue
+        grep -q "    $f" "$REPO_DIR/install.sh" || missing+="$f "
+    done
+    [[ -z "$missing" ]]
+    check "every registered module is in the installer manifest" "$?" "$missing"
+
+    # Config examples referenced by the installer must exist.
+    local ioc
+    for ioc in $(grep -A8 '^AUDIT_IOC_FILES=(' "$REPO_DIR/install.sh" | grep -oE '^\s+[a-z-]+\.conf' | tr -d ' '); do
+        [[ -f "$REPO_DIR/config/${ioc}.example" ]] || missing+="config/${ioc}.example "
+    done
+    [[ -z "$missing" ]]
+    check "every IOC file the installer expects exists in the repo" "$?" "$missing"
+}
+
+# ============================================================
 # TEST: SSH session monitoring and enforcement
 #
 # Every scenario the operator asked for, driven from a fixture
@@ -783,6 +836,7 @@ test_remediation
 test_health
 test_cron
 test_self_protection
+test_installer
 test_ssh_session
 test_ssh_enforce
 test_sshd_config
