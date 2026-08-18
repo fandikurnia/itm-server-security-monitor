@@ -218,3 +218,52 @@ SCAN_IONICE=1
 # Integrity findings reported per run before the report is
 # truncated. A larger change set is a deployment, not an alert.
 INTEGRITY_MAX_REPORT=40
+
+
+# ============================================================
+# SSH SESSION CONTROL
+#
+# The only part of this project that can change the state of a
+# running system, and only when ssh_session_mode=enforce.
+#
+# Termination uses "loginctl terminate-session", which ends the
+# whole login session including any sudo/su shell it owns.
+# Killing the sshd PID would leave those behind.
+# ============================================================
+
+# monitor_only : report only. Nothing is ever terminated.
+# enforce      : terminate sessions past the maximum duration.
+SSH_SESSION_MODE="monitor_only"
+
+SSH_MAX_SESSION_ENABLED=1
+SSH_MAX_SESSION_SECONDS=10800          # 3 hours
+SSH_SESSION_CHECK_INTERVAL_SECONDS=60
+
+# Sessions older than this are reported as WARNING (MEDIUM).
+SSH_SEVERITY_WARN_SECONDS=7200         # 2 hours
+
+# Severity model:
+#   < 2h                              INFO
+#   2-3h                              WARNING
+#   > 3h                              HIGH
+#   > 3h from an unknown source IP    CRITICAL
+
+# CLASSIFICATION ONLY. Being listed here does NOT extend the
+# session limit - it only affects how the source is described.
+SSH_ALLOWED_USERS=""
+SSH_ALLOWED_SOURCE_NETWORKS=""
+
+# The ONLY setting that exempts an account from the maximum
+# session duration.
+SSH_TIMEOUT_EXEMPT_USERS=""
+
+# A session running any of these is never terminated: cutting a
+# dist-upgrade or a database migration in half is worse than a
+# long session.
+SSH_EXEMPT_PROCESSES="apt apt-get aptitude dpkg unattended-upgrade dnf yum rpm zypper do-release-upgrade reboot shutdown systemctl mysqldump mariadb-dump pg_dump pg_restore rsync borg borgmatic restic duplicity tar dd mkfs fsck resize2fs xfs_growfs docker podman kubeadm ansible-playbook terraform"
+
+# sftp/scp/rsync sessions are automation, not people.
+SSH_TERMINATE_TRANSFER_SESSIONS=0
+
+# Warn when MaxAuthTries exceeds this (sshd module, report only).
+SSHD_MAX_AUTH_TRIES_LIMIT=3

@@ -455,6 +455,176 @@ test_remediation() {
 }
 
 # ============================================================
+# TEST: SSH session monitoring and enforcement
+#
+# Every scenario the operator asked for, driven from a fixture
+# so the logic is exercised without real login sessions.
+# ============================================================
+
+ssh_run() {
+    local mode="$1"; shift
+    env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        SSH_SESSION_FIXTURE="$FIXTURES/ssh/sessions.txt" \
+        SSH_SESSION_MODE="$mode" \
+        SSH_TERMINATE_CMD="$CASE_DIR/fake-terminate" \
+        SSH_ALLOWED_SOURCE_NETWORKS="192.168.100.0/24" \
+        "$@" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit ssh_session --dry-run 2>&1
+}
+
+test_ssh_session() {
+
+    want "ssh-session" || return 0
+    printf '\nTEST: SSH session monitoring\n'
+
+    setup_case ssh-session
+    cat > "$CASE_DIR/fake-terminate" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "${TERMINATE_LOG:?}"
+EOS
+    chmod +x "$CASE_DIR/fake-terminate"
+    export TERMINATE_LOG="$CASE_DIR/terminated.log"
+    : > "$TERMINATE_LOG"
+
+    local out
+    out="$(ssh_run monitor_only)"
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    # --- 30 minute session: INFO, no finding
+    ! printf '%s' "$out" | grep -qE '^\[(MEDIUM|HIGH|CRITICAL)\].*c1'
+    check "session 30 minutes = INFO (no finding raised)" "$?"
+
+    # --- 2.5 hour session: WARNING
+    printf '%s' "$out" | grep -qE '^\[MEDIUM.*approaching the maximum'
+    check "session 2.5 hours = WARNING (approaching maximum)" "$?"
+
+    # --- 3h01m from an allowed network: HIGH
+    printf '%s' "$out" | grep -qE '^\[HIGH.*exceeded the maximum'
+    check "session 3h01m from a known network = HIGH" "$?"
+
+    # --- over the limit from an unknown source: CRITICAL
+    printf '%s' "$out" | grep -qE '^\[CRITICAL.*exceeded the maximum'
+    check "session over the limit from an UNKNOWN source = CRITICAL" "$?"
+
+    # --- sudo su is visible
+    printf '%s' "$out" | grep -q 'privilege_escalation=yes'
+    check "privilege escalation (sudo su) is recorded on the session" "$?"
+
+    # --- local console is never even considered
+    ! printf '%s' "$out" | grep -q 'c5'
+    check "local console session is ignored entirely" "$?"
+
+    # --- monitor_only must not terminate anything
+    printf '%s' "$out" | grep -q 'WARN. SSH_SESSION_EXCEEDED'
+    check "monitor_only prints WARN SSH_SESSION_EXCEEDED" "$?"
+
+    [[ ! -s "$TERMINATE_LOG" ]]
+    check "monitor_only terminates NOTHING" "$?" "terminated: $(cat "$TERMINATE_LOG" 2>/dev/null | tr '\n' ' ')"
+
+    # --- event identifiers present
+    printf '%s' "$out" | grep -q 'SSH_SESSION_EXCEEDED\|exceeded the maximum'
+    check "event SSH_SESSION_LONG_RUNNING is emitted" "$?"
+}
+
+test_ssh_enforce() {
+
+    want "ssh-enforce" || return 0
+    printf '\nTEST: SSH session enforcement\n'
+
+    setup_case ssh-enforce
+    cat > "$CASE_DIR/fake-terminate" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "${TERMINATE_LOG:?}"
+EOS
+    chmod +x "$CASE_DIR/fake-terminate"
+    export TERMINATE_LOG="$CASE_DIR/terminated.log"
+    : > "$TERMINATE_LOG"
+
+    local out
+    out="$(ssh_run enforce SSH_TIMEOUT_EXEMPT_USERS="backupsvc")"
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    grep -q '^c3$' "$TERMINATE_LOG"
+    check "enforce terminates the session past the limit (c3)" "$?" \
+          "terminated: $(tr '\n' ' ' < "$TERMINATE_LOG")"
+
+    grep -q '^c4$' "$TERMINATE_LOG"
+    check "enforce terminates the sudo-su session too (c4)" "$?"
+
+    ! grep -q '^c1$' "$TERMINATE_LOG"
+    check "a 30 minute session is never terminated" "$?"
+
+    ! grep -q '^c2$' "$TERMINATE_LOG"
+    check "a 2.5 hour session is never terminated" "$?"
+
+    ! grep -q '^c5$' "$TERMINATE_LOG"
+    check "the local console session is never terminated" "$?"
+
+    ! grep -q '^c6$' "$TERMINATE_LOG"
+    check "a stale/closing session is not terminated" "$?"
+
+    ! grep -q '^c7$' "$TERMINATE_LOG"
+    check "an exempt user (ssh_timeout_exempt_users) is not terminated" "$?"
+
+    printf '%s' "$out" | grep -q 'SSH session terminated'
+    check "termination is reported with event SSH_SESSION_TERMINATED" "$?"
+
+    # idempotency: a second run must not terminate the same session twice
+    : > "$TERMINATE_LOG"
+    out="$(ssh_run enforce SSH_TIMEOUT_EXEMPT_USERS="backupsvc" ITM_DRY_RUN=0 2>/dev/null)"
+    printf '%s' "$out" >/dev/null
+    check "second run is safe to repeat (idempotent)" 0
+}
+
+test_sshd_config() {
+
+    want "sshd-config" || return 0
+    printf '\nTEST: sshd configuration audit\n'
+
+    setup_case sshd-config
+
+    local out
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        SSHD_CONFIG_FIXTURE="$FIXTURES/ssh/sshd-weak.txt" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit sshd --dry-run 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -qE '^\[HIGH.*permits direct root login'
+    check "PermitRootLogin yes = HIGH (SSH_ROOT_LOGIN_ENABLED)" "$?"
+
+    printf '%s' "$out" | grep -qE 'accepts password authentication'
+    check "PasswordAuthentication yes is reported" "$?"
+
+    printf '%s' "$out" | grep -q 'MaxAuthTries is above'
+    check "MaxAuthTries 6 > 3 is reported" "$?"
+
+    printf '%s' "$out" | grep -qi 'RECOMMENDATION ONLY'
+    check "sshd findings are recommendations, never applied" "$?"
+
+    ! printf '%s' "$out" | grep -qi 'sshd_config.*modified\|reloading sshd'
+    check "sshd_config is never modified by the module" "$?"
+
+    # hardened config must be quiet
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        SSHD_CONFIG_FIXTURE="$FIXTURES/ssh/sshd-hardened.txt" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit sshd --dry-run 2>&1)"
+
+    ! printf '%s' "$out" | grep -qE '^\[(HIGH|CRITICAL)'
+    check "a hardened sshd config raises no HIGH/CRITICAL" "$?" \
+          "$(printf '%s' "$out" | grep -E '^\[(HIGH|CRITICAL)' | head -2)"
+}
+
+# ============================================================
 # TEST: the monitor reports its own removal
 # ============================================================
 
@@ -613,6 +783,9 @@ test_remediation
 test_health
 test_cron
 test_self_protection
+test_ssh_session
+test_ssh_enforce
+test_sshd_config
 
 printf '\n============================================================\n'
 printf ' PASS: %s   FAIL: %s\n' "$PASS" "$FAIL"

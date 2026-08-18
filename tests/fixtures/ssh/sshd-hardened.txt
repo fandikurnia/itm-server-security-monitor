@@ -1,0 +1,7 @@
+port 2222
+permitrootlogin no
+passwordauthentication no
+pubkeyauthentication yes
+maxauthtries 3
+clientaliveinterval 300
+clientalivecountmax 2
