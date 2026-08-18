@@ -102,7 +102,17 @@ rem_header() {
         printf 'EVIDENCE="$INCIDENT_DIR/evidence"\n'
         printf 'mkdir -p "$QUARANTINE" "$EVIDENCE"\n'
         printf 'chmod 700 "$INCIDENT_DIR" "$QUARANTINE" "$EVIDENCE"\n\n'
+        printf 'CHANGED=0\n'
+        printf 'NOTIFY=%s\n' "$(rem_q "$ITM_NOTIFY_BIN")"
         printf 'log() { printf "[%%s] %%s\\n" "$(date +%%H:%%M:%%S)" "$*"; }\n'
+        printf '\n'
+        printf '# Containment is an outward facing action. It is announced on\n'
+        printf '# the same channel as the detection, so the change is visible to\n'
+        printf '# everyone watching - including whoever did not run it.\n'
+        printf 'notify() {\n'
+        printf '    [[ -x "$NOTIFY" ]] || return 0\n'
+        printf '    "$NOTIFY" "$1" >/dev/null 2>&1 || log "WARN: Telegram notification failed"\n'
+        printf '}\n'
         printf 'abort() { printf "\\n*** ABORTED: %%s\\n" "$*" >&2; exit 1; }\n\n'
         printf 'if [[ $EUID -ne 0 ]]; then\n'
         printf '    log "WARNING: not running as root - evidence collection may be incomplete"\n'
@@ -172,8 +182,29 @@ rem_confirm_gate() {
         printf '    log "Re-run with CONFIRM=yes to apply the containment above."\n'
         printf '    exit 0\n'
         printf 'fi\n\n'
+        printf '# A typed confirmation, not just an environment variable.\n'
+        printf '# CONFIRM=yes can be set by accident, reused from shell history,\n'
+        printf '# or inherited by a script. Typing the word cannot.\n'
+        printf 'if [[ "${FORCE:-no}" != "yes" ]]; then\n'
+        printf '    if [[ -t 0 ]]; then\n'
+        printf '        printf "Type CONTAIN to proceed, anything else to abort: "\n'
+        printf '        read -r ANSWER\n'
+        printf '        [[ "$ANSWER" == "CONTAIN" ]] || abort "not confirmed by the operator"\n'
+        printf '    else\n'
+        printf '        # No terminal: a containment cannot be triggered by a\n'
+        printf '        # pipeline, a cron job or a copied command line without\n'
+        printf '        # someone saying so explicitly.\n'
+        printf '        abort "no terminal available for confirmation - re-run interactively, or set FORCE=yes to bypass the typed confirmation deliberately"\n'
+        printf '    fi\n'
+        printf 'fi\n\n'
+        printf 'OPERATOR="${SUDO_USER:-$(id -un 2>/dev/null)}"\n'
+        printf 'FROM="${SSH_CONNECTION:-}"\n'
+        printf 'FROM="${FROM%%%% *}"\n'
+        printf '[[ -n "$FROM" ]] || FROM="local session (not proof of console access)"\n\n'
     } >> "$file"
 }
+
+REM_NOTIFY_TITLE=""; REM_NOTIFY_SEV=""; REM_NOTIFY_PATH=""; REM_NOTIFY_REF=""
 
 rem_footer() {
     local file="$1" rollback="$2"
@@ -186,6 +217,23 @@ rem_footer() {
             printf '#   %s\n' "$line"
         done <<< "$rollback"
         printf '#\n\n'
+        printf 'if (( CHANGED )); then\n'
+        printf '    notify "🛠️ REMEDIATION APPLIED\n'
+        printf '\n'
+        printf 'Finding  : %s\n' "$REM_NOTIFY_TITLE"
+        printf 'Severity : %s\n' "$REM_NOTIFY_SEV"
+        printf 'Path     : %s\n' "$REM_NOTIFY_PATH"
+        printf 'Action   : contained (file moved to quarantine, not deleted)\n'
+        printf 'Operator : $OPERATOR\n'
+        printf 'Source   : $FROM\n'
+        printf 'Evidence : $INCIDENT_DIR\n'
+        printf 'Ref      : %s\n' "$REM_NOTIFY_REF"
+        printf '\n'
+        printf 'Rollback instructions are in PHASE 4 of the script."\n'
+        printf '    log "Telegram notified"\n'
+        printf 'else\n'
+        printf '    log "nothing was changed on this host"\n'
+        printf 'fi\n\n'
         printf 'log "done. Evidence: $EVIDENCE   Quarantine: $QUARANTINE"\n'
         printf 'log "Re-run the audit to confirm: itm-security audit"\n'
     } >> "$file"
@@ -200,6 +248,7 @@ rem_quarantine_move() {
         printf 'log "moving $TARGET to quarantine"\n'
         printf 'mv -- "$TARGET" "$QUARANTINE/$SAFE_NAME" || abort "move failed"\n'
         printf 'chmod 600 "$QUARANTINE/$SAFE_NAME" 2>/dev/null || true\n'
+        printf 'CHANGED=1\n'
         printf 'log "quarantined -> $QUARANTINE/$SAFE_NAME"\n'
         printf 'log "the file is NO LONGER served, and is NOT deleted"\n'
     } >> "$file"
@@ -311,6 +360,7 @@ Check the unit file in the evidence directory before continuing."
                 printf 'log "stopping and disabling $UNIT"\n'
                 printf 'systemctl disable --now "$UNIT" 2>&1 | tee -a "$EVIDENCE/$SAFE_NAME.unit.txt"\n'
                 printf 'systemctl mask "$UNIT" 2>&1 | tee -a "$EVIDENCE/$SAFE_NAME.unit.txt"\n'
+                printf 'CHANGED=1\n'
             } >> "$file"
             rem_quarantine_move "$file"
             {
@@ -355,6 +405,7 @@ The full PAM directory has already been backed up to the evidence folder."
                 printf 'sed -i "s|^\\([^#].*pam_exec\\.so.*\\)$|# ITM-DISABLED \\1|" -- "$PAMFILE"\n'
                 printf 'log "diff:"\n'
                 printf 'diff -u "$EVIDENCE/$(basename -- "$PAMFILE").before" "$PAMFILE" || true\n'
+                printf 'CHANGED=1\n'
                 printf 'log "TEST AUTHENTICATION NOW, from a second session, before closing this one"\n'
             } >> "$file"
             rem_footer "$file" \
@@ -556,6 +607,11 @@ rem_generate() {
             "${REM_TITLE[$i]}" "${REM_SEV[$i]}" "${REM_CONF[$i]}" \
             "${REM_PATH[$i]}" "${REM_HASH[$i]}" "${REM_REASONS[$i]}" \
             "${REM_FP[$i]}" "${REM_MODULE[$i]}"
+
+        REM_NOTIFY_TITLE="${REM_TITLE[$i]}"
+        REM_NOTIFY_SEV="${REM_SEV[$i]}"
+        REM_NOTIFY_PATH="${REM_PATH[$i]:-n/a}"
+        REM_NOTIFY_REF="${REM_FP[$i]}"
 
         rem_template "$file" \
             "${REM_ID[$i]}" "${REM_PATH[$i]}" "${REM_HASH[$i]}" \

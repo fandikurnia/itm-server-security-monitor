@@ -434,13 +434,275 @@ test_remediation() {
     find "$inc/evidence" -type f 2>/dev/null | grep -q .
     check "dry run still preserves evidence" "$?"
 
+    # CONFIRM alone must not be enough without a terminal
+    [[ -n "$one" ]] && CONFIRM=yes bash "$one" </dev/null >/dev/null 2>&1
+    [[ -f "$root/vendor.js" ]]
+    check "CONFIRM=yes without a terminal aborts (no accidental containment)" "$?"
+
     # confirmed run quarantines, and the file is recoverable
-    [[ -n "$one" ]] && CONFIRM=yes bash "$one" >/dev/null 2>&1
+    [[ -n "$one" ]] && CONFIRM=yes FORCE=yes bash "$one" </dev/null >/dev/null 2>&1
     [[ ! -f "$root/vendor.js" ]]
     check "CONFIRM=yes removes the file from the web root" "$?"
 
     find "$inc/quarantine" -type f 2>/dev/null | grep -q .
     check "the file is quarantined, not deleted (recoverable)" "$?"
+
+    grep -q 'REMEDIATION APPLIED' "$one"
+    check "containment announces itself to Telegram" "$?"
+
+    grep -q 'Type CONTAIN to proceed' "$one"
+    check "a typed confirmation is required, not just an env var" "$?"
+}
+
+# ============================================================
+# TEST: installer well-formedness
+#
+# bash -n accepts an install(1) call with a source but no
+# destination - it is valid syntax and a broken command. That
+# exact mistake aborted a production upgrade mid-run, so it is
+# checked statically here.
+# ============================================================
+
+test_installer() {
+
+    want "installer" || return 0
+    printf '\nTEST: installer well-formedness\n'
+
+    local bad
+    bad="$(awk '
+      /^install \\$/ { inblk=1; blk=""; line=NR }
+      inblk {
+        blk = blk " " $0
+        if ($0 !~ /\\$/) {
+          inblk=0
+          isdir = (blk ~ /-d /)
+          gsub(/install|\\|-o root|-g root|-m [0-7]+|-d/, "", blk)
+          n=split(blk, a, /[[:space:]]+/); c=0
+          for(i=1;i<=n;i++) if(a[i] != "") c++
+          if (!isdir && c < 2) printf "line %s has %d argument(s)\n", line, c
+        }
+      }
+    ' "$REPO_DIR/install.sh")"
+
+    [[ -z "$bad" ]]
+    check "every install(1) call has a destination" "$?" "$bad"
+
+    # Every module the CLI knows about must be installed.
+    local m missing=""
+    for m in $(grep -m1 '^ITM_ALL_MODULES=' "$REPO_DIR/bin/itm-security" | cut -d'"' -f2); do
+        local f
+        f="$(grep -A1 "        ${m})" "$REPO_DIR/bin/itm-security" | grep -oE "audit_[a-z_]+\.sh" | head -1)"
+        [[ -n "$f" ]] || continue
+        grep -q "    $f" "$REPO_DIR/install.sh" || missing+="$f "
+    done
+    [[ -z "$missing" ]]
+    check "every registered module is in the installer manifest" "$?" "$missing"
+
+    # Config examples referenced by the installer must exist.
+    local ioc
+    for ioc in $(grep -A8 '^AUDIT_IOC_FILES=(' "$REPO_DIR/install.sh" | grep -oE '^\s+[a-z-]+\.conf' | tr -d ' '); do
+        [[ -f "$REPO_DIR/config/${ioc}.example" ]] || missing+="config/${ioc}.example "
+    done
+    [[ -z "$missing" ]]
+    check "every IOC file the installer expects exists in the repo" "$?" "$missing"
+}
+
+# ============================================================
+# TEST: SSH session monitoring and enforcement
+#
+# Every scenario the operator asked for, driven from a fixture
+# so the logic is exercised without real login sessions.
+# ============================================================
+
+ssh_run() {
+    local mode="$1"; shift
+    env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        SSH_SESSION_FIXTURE="$FIXTURES/ssh/sessions.txt" \
+        SSH_SESSION_MODE="$mode" \
+        SSH_TERMINATE_CMD="$CASE_DIR/fake-terminate" \
+        SSH_ALLOWED_SOURCE_NETWORKS="192.168.100.0/24" \
+        "$@" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit ssh_session --dry-run 2>&1
+}
+
+test_ssh_session() {
+
+    want "ssh-session" || return 0
+    printf '\nTEST: SSH session monitoring\n'
+
+    setup_case ssh-session
+    cat > "$CASE_DIR/fake-terminate" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "${TERMINATE_LOG:?}"
+EOS
+    chmod +x "$CASE_DIR/fake-terminate"
+    export TERMINATE_LOG="$CASE_DIR/terminated.log"
+    : > "$TERMINATE_LOG"
+
+    local out
+    out="$(ssh_run monitor_only)"
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    # --- 30 minute session: INFO, no finding
+    ! printf '%s' "$out" | grep -qE '^\[(MEDIUM|HIGH|CRITICAL)\].*c1'
+    check "session 30 minutes = INFO (no finding raised)" "$?"
+
+    # --- 2.5 hour session: WARNING
+    printf '%s' "$out" | grep -qE '^\[MEDIUM.*approaching the maximum'
+    check "session 2.5 hours = WARNING (approaching maximum)" "$?"
+
+    # --- 3h01m from an allowed network: HIGH
+    printf '%s' "$out" | grep -qE '^\[HIGH.*exceeded the maximum'
+    check "session 3h01m from a known network = HIGH" "$?"
+
+    # --- over the limit from an unknown source: CRITICAL
+    printf '%s' "$out" | grep -qE '^\[CRITICAL.*exceeded the maximum'
+    check "session over the limit from an UNKNOWN source = CRITICAL" "$?"
+
+    # --- sudo su is visible
+    printf '%s' "$out" | grep -q 'privilege_escalation=yes'
+    check "privilege escalation (sudo su) is recorded on the session" "$?"
+
+    # --- local console is never even considered
+    ! printf '%s' "$out" | grep -q 'c5'
+    check "local console session is ignored entirely" "$?"
+
+    # --- monitor_only must not terminate anything
+    printf '%s' "$out" | grep -q 'WARN. SSH_SESSION_EXCEEDED'
+    check "monitor_only prints WARN SSH_SESSION_EXCEEDED" "$?"
+
+    [[ ! -s "$TERMINATE_LOG" ]]
+    check "monitor_only terminates NOTHING" "$?" "terminated: $(cat "$TERMINATE_LOG" 2>/dev/null | tr '\n' ' ')"
+
+    # --- event identifiers present
+    printf '%s' "$out" | grep -q 'SSH_SESSION_EXCEEDED\|exceeded the maximum'
+    check "event SSH_SESSION_LONG_RUNNING is emitted" "$?"
+}
+
+test_ssh_enforce() {
+
+    want "ssh-enforce" || return 0
+    printf '\nTEST: SSH session enforcement\n'
+
+    setup_case ssh-enforce
+    cat > "$CASE_DIR/fake-terminate" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "${TERMINATE_LOG:?}"
+EOS
+    chmod +x "$CASE_DIR/fake-terminate"
+    export TERMINATE_LOG="$CASE_DIR/terminated.log"
+    : > "$TERMINATE_LOG"
+
+    local out
+    out="$(ssh_run enforce SSH_TIMEOUT_EXEMPT_USERS="backupsvc")"
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    grep -q '^c3$' "$TERMINATE_LOG"
+    check "enforce terminates the session past the limit (c3)" "$?" \
+          "terminated: $(tr '\n' ' ' < "$TERMINATE_LOG")"
+
+    grep -q '^c4$' "$TERMINATE_LOG"
+    check "enforce terminates the sudo-su session too (c4)" "$?"
+
+    ! grep -q '^c1$' "$TERMINATE_LOG"
+    check "a 30 minute session is never terminated" "$?"
+
+    ! grep -q '^c2$' "$TERMINATE_LOG"
+    check "a 2.5 hour session is never terminated" "$?"
+
+    ! grep -q '^c5$' "$TERMINATE_LOG"
+    check "the local console session is never terminated" "$?"
+
+    ! grep -q '^c6$' "$TERMINATE_LOG"
+    check "a stale/closing session is not terminated" "$?"
+
+    ! grep -q '^c7$' "$TERMINATE_LOG"
+    check "an exempt user (ssh_timeout_exempt_users) is not terminated" "$?"
+
+    printf '%s' "$out" | grep -q 'SSH session terminated'
+    check "termination is reported with event SSH_SESSION_TERMINATED" "$?"
+
+    # idempotency: a second run must not terminate the same session twice
+    : > "$TERMINATE_LOG"
+    out="$(ssh_run enforce SSH_TIMEOUT_EXEMPT_USERS="backupsvc" ITM_DRY_RUN=0 2>/dev/null)"
+    printf '%s' "$out" >/dev/null
+    check "second run is safe to repeat (idempotent)" 0
+}
+
+test_sshd_config() {
+
+    want "sshd-config" || return 0
+    printf '\nTEST: sshd configuration audit\n'
+
+    setup_case sshd-config
+
+    local out
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        SSHD_CONFIG_FIXTURE="$FIXTURES/ssh/sshd-weak.txt" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit sshd --dry-run 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -qE '^\[HIGH.*permits direct root login'
+    check "PermitRootLogin yes = HIGH (SSH_ROOT_LOGIN_ENABLED)" "$?"
+
+    printf '%s' "$out" | grep -qE 'accepts password authentication'
+    check "PasswordAuthentication yes is reported" "$?"
+
+    printf '%s' "$out" | grep -q 'MaxAuthTries is above'
+    check "MaxAuthTries 6 > 3 is reported" "$?"
+
+    printf '%s' "$out" | grep -qi 'RECOMMENDATION ONLY'
+    check "sshd findings are recommendations, never applied" "$?"
+
+    ! printf '%s' "$out" | grep -qi 'sshd_config.*modified\|reloading sshd'
+    check "sshd_config is never modified by the module" "$?"
+
+    # hardened config must be quiet
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        SSHD_CONFIG_FIXTURE="$FIXTURES/ssh/sshd-hardened.txt" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit sshd --dry-run 2>&1)"
+
+    ! printf '%s' "$out" | grep -qE '^\[(HIGH|CRITICAL)'
+    check "a hardened sshd config raises no HIGH/CRITICAL" "$?" \
+          "$(printf '%s' "$out" | grep -E '^\[(HIGH|CRITICAL)' | head -2)"
+}
+
+# ============================================================
+# TEST: the monitor reports its own removal
+# ============================================================
+
+test_self_protection() {
+
+    want "self-protection" || return 0
+    printf '\nTEST: monitor self-protection\n'
+
+    grep -q '/usr/local/sbin/itm-security' "$REPO_DIR/bin/security-file-monitor"
+    check "the file monitor watches the monitor's own binaries" "$?"
+
+    grep -q '/etc/security-monitor' "$REPO_DIR/bin/security-file-monitor"
+    check "the file monitor watches the monitor's configuration" "$?"
+
+    grep -q 'SECURITY MONITOR MODIFIED' "$REPO_DIR/bin/security-file-monitor"
+    check "modification of the monitor is its own CRITICAL severity" "$?"
+
+    grep -q 'SECURITY MONITOR BEING UNINSTALLED' "$REPO_DIR/uninstall.sh"
+    check "uninstall announces itself before removing the notifier" "$?"
+
+    grep -q 'SECURITY MONITOR REMOVED' "$REPO_DIR/uninstall.sh"
+    check "uninstall sends a final message after removal" "$?"
+
+    grep -q 'heartbeat)' "$REPO_DIR/bin/itm-security"
+    check "a heartbeat command exists so silence can be detected remotely" "$?"
 }
 
 # ============================================================
@@ -573,6 +835,11 @@ test_safety_invariants
 test_remediation
 test_health
 test_cron
+test_self_protection
+test_installer
+test_ssh_session
+test_ssh_enforce
+test_sshd_config
 
 printf '\n============================================================\n'
 printf ' PASS: %s   FAIL: %s\n' "$PASS" "$FAIL"

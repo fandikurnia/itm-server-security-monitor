@@ -1,0 +1,10 @@
+# FIXTURE - normalised loginctl records, one per test scenario.
+# id|user|remote|remote_host|tty|leader|service|class|type|state|age_seconds|privesc
+c1|deploy|yes|192.168.100.25|pts/0|1001|sshd|user|tty|active|1800|no
+c2|deploy|yes|192.168.100.25|pts/1|1002|sshd|user|tty|active|9000|no
+c3|admin|yes|192.168.100.30|pts/2|1003|sshd|user|tty|active|10860|no
+c4|admin|yes|192.168.100.31|pts/3|1004|sshd|user|tty|active|11000|yes
+c5|root|no||tty1|1005||user|tty|active|99999|no
+c6|ghost|yes|192.168.100.99|pts/9|0|sshd|user|tty|closing|20000|no
+c7|backupsvc|yes|192.168.100.40|pts/4|1007|sshd|user|tty|active|12000|no
+c8|jenkins|yes|203.0.113.77|pts/5|1008|sshd|user|tty|active|12500|no

@@ -58,6 +58,8 @@ AUDIT_MODULES=(
     audit_cron.sh
     audit_command.sh
     audit_ioc.sh
+    audit_sshd.sh
+    audit_ssh_session.sh
     audit_nginx.sh
     audit_apache.sh
     audit_php.sh
@@ -399,9 +401,15 @@ install \
     -o root \
     -g root \
     -m 0600 \
-    "$SCRIPT_DIR/lib/itm-web-common.sh"
-    "$SCRIPT_DIR/lib/itm-remediate.sh" \
+    "$SCRIPT_DIR/lib/itm-web-common.sh" \
     "$AUDIT_LIB_DIR/itm-web-common.sh"
+
+install \
+    -o root \
+    -g root \
+    -m 0600 \
+    "$SCRIPT_DIR/lib/itm-remediate.sh" \
+    "$AUDIT_LIB_DIR/itm-remediate.sh"
 
 install \
     -o root \
@@ -845,7 +853,10 @@ echo "    $F2B_BAN_ACTION"
 # both Linux families.
 # ============================================================
 
-cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+F2B_JAIL="/etc/fail2ban/jail.d/sshd.local"
+F2B_GENERATED="$(mktemp)"
+
+cat > "$F2B_GENERATED" <<EOF
 [sshd]
 
 enabled = true
@@ -865,8 +876,67 @@ action = ${F2B_BAN_ACTION}[name=SSHD, port="22", protocol=tcp]
          telegram-security[name=SSHD]
 EOF
 
-chown root:root /etc/fail2ban/jail.d/sshd.local
-chmod 644 /etc/fail2ban/jail.d/sshd.local
+#
+# An existing jail is treated as operator configuration, not as
+# something the installer owns. Ban times, ignoreip and maxretry
+# get tuned per site, and silently resetting them on every
+# upgrade would undo that tuning without anyone noticing.
+#
+if [[ -f "$F2B_JAIL" ]]; then
+
+    if cmp -s "$F2B_JAIL" "$F2B_GENERATED"; then
+        echo "[+] Fail2Ban sshd jail already matches the generated policy."
+        rm -f "$F2B_GENERATED"
+    else
+        install -o root -g root -m 0644 "$F2B_GENERATED" "${F2B_JAIL}.itm-new"
+        rm -f "$F2B_GENERATED"
+        echo "[!] Existing Fail2Ban sshd jail PRESERVED (it differs from the generated policy)."
+        echo "    Proposed version written to: ${F2B_JAIL}.itm-new"
+        echo "    Compare with: diff -u ${F2B_JAIL} ${F2B_JAIL}.itm-new"
+    fi
+
+else
+    install -o root -g root -m 0644 "$F2B_GENERATED" "$F2B_JAIL"
+    rm -f "$F2B_GENERATED"
+    echo "[+] Fail2Ban sshd jail created."
+fi
+
+
+
+# ============================================================
+# INTEGRITY MANIFEST
+#
+# Hashes of everything just installed, so "itm-security health"
+# can tell an upgrade apart from tampering. Paths are relative
+# to / so the manifest verifies with: cd / && sha256sum -c
+# ============================================================
+
+ITM_MANIFEST="/var/lib/itm-security/manifest.sha256"
+
+install -o root -g root -m 0700 -d /var/lib/itm-security
+
+{
+    cd / || exit 1
+    for f in \
+        usr/local/sbin/security-notify \
+        usr/local/sbin/ssh-login-alert \
+        usr/local/sbin/security-file-monitor \
+        usr/local/sbin/itm-command-relay \
+        usr/local/sbin/itm-security \
+        usr/local/sbin/itm-web-realtime \
+        etc/profile.d/sysadmin.sh \
+        etc/fail2ban/action.d/telegram-security.conf
+    do
+        [[ -f "$f" ]] && sha256sum "$f"
+    done
+    find usr/local/lib/itm-security -type f -name '*.sh' -exec sha256sum {} + 2>/dev/null
+    find etc/systemd/system -maxdepth 1 -type f \( -name 'itm-*' -o -name 'security-file-monitor.service' \) \
+        -exec sha256sum {} + 2>/dev/null
+} > "$ITM_MANIFEST" 2>/dev/null
+
+chmod 600 "$ITM_MANIFEST"
+
+echo "[+] Integrity manifest written ($(wc -l < "$ITM_MANIFEST") files)."
 
 # ============================================================
 # SYSTEMD

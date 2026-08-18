@@ -15,6 +15,18 @@ WATCH_PATHS=(
   "/lib/systemd/system"
   "/usr/lib/systemd/system"
   "/root/.ssh"
+
+  # The monitor's own files. Removing or editing the security
+  # tooling is itself a security event, and it is the first
+  # thing an intruder does once they notice it.
+  "/usr/local/sbin/security-notify"
+  "/usr/local/sbin/ssh-login-alert"
+  "/usr/local/sbin/security-file-monitor"
+  "/usr/local/sbin/itm-command-relay"
+  "/usr/local/sbin/itm-security"
+  "/usr/local/sbin/itm-web-realtime"
+  "/usr/local/lib/itm-security"
+  "/etc/security-monitor"
 )
 
 # Add .ssh directories for normal interactive users.
@@ -49,6 +61,10 @@ while IFS='|' read -r EVENT_TIME EVENT FILE; do
       SEVERITY="🔴 CRITICAL - ACCOUNT DATABASE CHANGE" ;;
     /etc/sudoers|/etc/sudoers.d/*)
       SEVERITY="🔴 CRITICAL - SUDO CHANGE" ;;
+    /usr/local/sbin/security-*|/usr/local/sbin/itm-*|/usr/local/lib/itm-security/*|/etc/security-monitor/*)
+      SEVERITY="🚨 CRITICAL - SECURITY MONITOR MODIFIED" ;;
+    /etc/systemd/system/itm-*|/etc/systemd/system/security-file-monitor.service)
+      SEVERITY="🚨 CRITICAL - SECURITY MONITOR UNIT CHANGED" ;;
     /etc/systemd/system/*|/lib/systemd/system/*|/usr/lib/systemd/system/*)
       SEVERITY="🔴 CRITICAL - SYSTEMD CHANGE" ;;
     /etc/ssh/*)

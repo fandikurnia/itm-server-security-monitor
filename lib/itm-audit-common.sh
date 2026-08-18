@@ -329,9 +329,9 @@ redact() {
     text="$(printf '%s' "$text" | sed -E \
         -e 's#[0-9]{6,12}:[A-Za-z0-9_-]{30,}#[REDACTED-BOT-TOKEN]#g' \
         -e 's#(-----BEGIN[A-Z ]*PRIVATE KEY-----).*#\1[REDACTED]#g' \
-        -e 's#([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][=:[:space:]]+)[^[:space:]"'"'"']+#\1[REDACTED]#g' \
+        -e 's#([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][=:]+)[^[:space:]"'"'"']+#\1[REDACTED]#g' \
         -e 's#([Pp][Aa][Ss][Ss][=:])[^[:space:]"'"'"']+#\1[REDACTED]#g' \
-        -e 's#([Tt][Oo][Kk][Ee][Nn][=:[:space:]]+)[^[:space:]"'"'"']+#\1[REDACTED]#g' \
+        -e 's#([Tt][Oo][Kk][Ee][Nn][=:]+)[^[:space:]"'"'"']+#\1[REDACTED]#g' \
         -e 's#([Ss][Ee][Cc][Rr][Ee][Tt][=:])[^[:space:]"'"'"']+#\1[REDACTED]#g' \
         -e 's#([Aa][Pp][Ii][_-]?[Kk][Ee][Yy][=:])[^[:space:]"'"'"']+#\1[REDACTED]#g' \
         -e 's#(CHAT_ID[=:])[^[:space:]"'"'"']+#\1[REDACTED]#g' \
@@ -963,7 +963,7 @@ add_finding() {
     local finding="$1"; shift
 
     local id="" path="" process="" network="" evidence="" action="" status=""
-    local confidence="" reasons="" filehash=""
+    local confidence="" reasons="" filehash="" event=""
     local kv
 
     for kv in "$@"; do
@@ -978,6 +978,7 @@ add_finding() {
             confidence=*) confidence="${kv#confidence=}" ;;
             reasons=*)    reasons="${kv#reasons=}" ;;
             hash=*)       filehash="${kv#hash=}" ;;
+            event=*)      event="${kv#event=}" ;;
         esac
     done
 
@@ -1083,10 +1084,11 @@ add_finding() {
 
     local json_record
     printf -v json_record \
-        '{"timestamp":"%s","hostname":"%s","module":"%s","severity":"%s","confidence":%s,"status":"%s","finding":"%s","path":"%s","process":"%s","network":"%s","evidence":"%s","reasons":[%s],"file_sha256":"%s","recommendation":"%s","fingerprint":"%s","host_trust":"%s","private_ip":"%s","run_id":"%s","audit_version":"%s"}' \
+        '{"timestamp":"%s","hostname":"%s","module":"%s","event":"%s","severity":"%s","confidence":%s,"status":"%s","finding":"%s","path":"%s","process":"%s","network":"%s","evidence":"%s","reasons":[%s],"file_sha256":"%s","recommendation":"%s","fingerprint":"%s","host_trust":"%s","private_ip":"%s","run_id":"%s","audit_version":"%s"}' \
         "$ts" \
         "$(json_escape "$ITM_HOSTNAME")" \
         "$(json_escape "$CURRENT_MODULE")" \
+        "$(json_escape "${event:-}")" \
         "$severity" \
         "$confidence" \
         "$status" \
