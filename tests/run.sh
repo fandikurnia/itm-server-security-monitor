@@ -646,6 +646,37 @@ test_installer() {
     [[ -z "$missing" ]]
     check "every registered module is in the installer manifest" "$?" "$missing"
 
+    # --- config migration must be additive only ----------------
+    local conf="$CASE_DIR/audit.conf"
+    mkdir -p "$CASE_DIR"
+    cat > "$conf" <<'EOC'
+HOST_TRUST_STATUS="UNTRUSTED"
+WEB_ROOTS="/var/www/html/portal"
+TELEGRAM_MIN_SEVERITY="MEDIUM"
+EOC
+
+    local added=0 tmpf
+    tmpf="$(mktemp)"
+    while IFS= read -r l; do
+        [[ "$l" =~ ^([A-Z_][A-Z0-9_]*)= ]] || continue
+        local k="${BASH_REMATCH[1]}"
+        grep -qE "^[[:space:]]*${k}=" "$conf" && continue
+        printf '%s\n' "$l" >> "$tmpf"; added=$(( added + 1 ))
+    done < "$REPO_DIR/config/audit.conf.example"
+    cat "$tmpf" >> "$conf"; rm -f "$tmpf"
+
+    grep -qx 'HOST_TRUST_STATUS="UNTRUSTED"' "$conf"
+    check "config migration keeps the operator's HOST_TRUST_STATUS" "$?"
+
+    [[ "$(grep -c '^WEB_ROOTS=' "$conf")" == "1" ]]
+    check "config migration does not duplicate an existing key" "$?"
+
+    grep -q '^SSH_SESSION_MODE=' "$conf"
+    check "config migration adds settings introduced later" "$?"
+
+    grep -qx 'TELEGRAM_MIN_SEVERITY="MEDIUM"' "$conf"
+    check "config migration never overwrites a tuned value" "$?"
+
     # Config examples referenced by the installer must exist.
     local ioc
     for ioc in $(grep -A8 '^AUDIT_IOC_FILES=(' "$REPO_DIR/install.sh" | grep -oE '^\s+[a-z-]+\.conf' | tr -d ' '); do
@@ -724,6 +755,21 @@ EOS
 
     [[ ! -s "$TERMINATE_LOG" ]]
     check "monitor_only terminates NOTHING" "$?" "terminated: $(cat "$TERMINATE_LOG" 2>/dev/null | tr '\n' ' ')"
+
+    # --- a remote session with no RemoteHost must still be seen
+    local nohost="$CASE_DIR/nohost.txt"
+    printf 'z1|opsuser|yes||pts/0|9001|sshd|user|tty|active|11000|yes\n' > "$nohost"
+    local out2
+    out2="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" \
+        ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        SSH_SESSION_FIXTURE="$nohost" SSH_SESSION_MODE=monitor_only \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit ssh_session --dry-run 2>&1)"
+
+    printf '%s' "$out2" | grep -qE '^\[CRITICAL.*exceeded the maximum'
+    check "remote session with an EMPTY source is still monitored (CRITICAL past limit)" "$?" \
+          "$(printf '%s' "$out2" | grep -m1 'SSH_SESSION_EXCEEDED')"
 
     # --- event identifiers present
     printf '%s' "$out" | grep -q 'SSH_SESSION_EXCEEDED\|exceeded the maximum'

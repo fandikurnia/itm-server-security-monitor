@@ -214,6 +214,17 @@ ssh_session_privesc() {
 ssh_is_remote_ssh() {
     local remote="$1" remote_host="$2" service="$3" class="$4" state="${5:-}"
     [[ "$remote" == "yes" ]] || return 1
+    #
+    # RemoteHost is NOT required.
+    #
+    # logind sometimes marks a session Remote=yes while leaving
+    # RemoteHost empty. Requiring it made those sessions
+    # invisible: they were never counted, never aged, and never
+    # eligible for enforcement. A session whose source cannot be
+    # established is the one that deserves MORE attention, not
+    # less - so it is monitored, and the unknown source pushes it
+    # to CRITICAL once it passes the limit.
+    #
     # A session that is already closing or closed is not a
     # candidate for anything: acting on it either does nothing or
     # lands on a reused session id.
@@ -221,7 +232,6 @@ ssh_is_remote_ssh() {
         active|online|opening|"") ;;
         *) return 1 ;;
     esac
-    [[ -n "$remote_host" ]]   || return 1
     case "$service" in
         sshd|ssh) ;;
         *) return 1 ;;
@@ -412,7 +422,12 @@ check_ssh_sessions() {
         [[ "$age" =~ ^[0-9]+$ ]] || age=0
 
         local known="yes"
-        ssh_source_is_known "$remote_host" || known="no"
+        if [[ -z "$remote_host" ]]; then
+            remote_host="unknown"
+            known="no"
+        else
+            ssh_source_is_known "$remote_host" || known="no"
+        fi
 
         local severity
         severity="$(ssh_severity_for "$age" "$known")"

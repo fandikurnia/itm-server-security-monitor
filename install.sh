@@ -516,7 +516,53 @@ done
 
 if [[ -f "$AUDIT_CONF" ]]; then
 
-    echo "[+] Existing audit.conf preserved."
+    #
+    # Preserve every value the operator set, but append keys this
+    # version introduced and the file does not have yet.
+    #
+    # Without this, a feature added after the host was installed
+    # is invisible: it runs on built-in defaults that nobody can
+    # see or tune, and the operator has no way to know the knob
+    # exists. Values already present are never touched, never
+    # reordered, and never re-commented.
+    #
+    CONF_ADDED=0
+    CONF_TMP="$(mktemp)"
+
+    while IFS= read -r conf_line; do
+
+        # Only KEY="value" / KEY=value lines are candidates.
+        [[ "$conf_line" =~ ^([A-Z_][A-Z0-9_]*)= ]] || continue
+        conf_key="${BASH_REMATCH[1]}"
+
+        # Already configured on this host: leave it alone.
+        grep -qE "^[[:space:]]*${conf_key}=" "$AUDIT_CONF" && continue
+
+        printf '%s\n' "$conf_line" >> "$CONF_TMP"
+        CONF_ADDED=$(( CONF_ADDED + 1 ))
+
+    done < "$SCRIPT_DIR/config/audit.conf.example"
+
+    if (( CONF_ADDED > 0 )); then
+        cp -a "$AUDIT_CONF" "${AUDIT_CONF}.bak-$(date +%Y%m%d-%H%M%S)"
+        {
+            printf '\n\n'
+            printf '# ============================================================\n'
+            printf '# Added by install.sh on %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            printf '#\n'
+            printf '# Settings introduced by this version. These are the built-in\n'
+            printf '# defaults, written here so they are visible and tunable.\n'
+            printf '# Nothing above this line was changed.\n'
+            printf '# ============================================================\n\n'
+            cat "$CONF_TMP"
+        } >> "$AUDIT_CONF"
+        echo "[+] audit.conf updated (+${CONF_ADDED} new setting(s), existing values untouched)."
+        echo "    Previous version: ${AUDIT_CONF}.bak-*"
+    else
+        echo "[+] Existing audit.conf already current."
+    fi
+
+    rm -f "$CONF_TMP"
 
 else
 
