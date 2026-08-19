@@ -115,6 +115,8 @@ REQUIRED_FILES=(
     "$SCRIPT_DIR/systemd/itm-web-scan.service"
     "$SCRIPT_DIR/systemd/itm-web-scan.timer"
     "$SCRIPT_DIR/systemd/itm-web-realtime.service"
+    "$SCRIPT_DIR/systemd/itm-ssh-session.service"
+    "$SCRIPT_DIR/systemd/itm-ssh-session.timer"
 )
 
 for ioc in "${AUDIT_IOC_FILES[@]}"; do
@@ -456,7 +458,43 @@ install -o root -g root -m 0700 -d "$AUDIT_IOC_DIR"
 for ioc in "${AUDIT_IOC_FILES[@]}"; do
 
     if [[ -f "$AUDIT_IOC_DIR/$ioc" ]]; then
-        echo "[+] Existing IOC list preserved: $ioc"
+
+        #
+        # Preserve the operator's file, but MERGE indicators that
+        # ship with this version and are not in it yet. Without
+        # this, a host upgraded after an incident keeps detecting
+        # last month's IOCs and none of the new ones - and the
+        # operator has no way to know what is missing.
+        #
+        # Additive only: nothing existing is removed or reordered,
+        # so local tuning and allowlists survive untouched.
+        #
+        IOC_ADDED=0
+        IOC_TMP="$(mktemp)"
+
+        while IFS= read -r ioc_line; do
+            case "$ioc_line" in
+                ''|\#*) continue ;;
+            esac
+            if ! grep -qxF -- "$ioc_line" "$AUDIT_IOC_DIR/$ioc" 2>/dev/null; then
+                printf '%s\n' "$ioc_line" >> "$IOC_TMP"
+                IOC_ADDED=$(( IOC_ADDED + 1 ))
+            fi
+        done < "$SCRIPT_DIR/config/${ioc}.example"
+
+        if (( IOC_ADDED > 0 )); then
+            cp -a "$AUDIT_IOC_DIR/$ioc" "$AUDIT_IOC_DIR/${ioc}.bak-$(date +%Y%m%d-%H%M%S)"
+            {
+                printf '\n# --- merged by install.sh on %s ---\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+                cat "$IOC_TMP"
+            } >> "$AUDIT_IOC_DIR/$ioc"
+            echo "[+] IOC list updated: $ioc (+${IOC_ADDED} new indicator(s), existing entries untouched)"
+        else
+            echo "[+] Existing IOC list already current: $ioc"
+        fi
+
+        rm -f "$IOC_TMP"
+
     else
         install \
             -o root \
@@ -592,6 +630,20 @@ install \
     -m 0644 \
     "$SCRIPT_DIR/systemd/itm-web-realtime.service" \
     /etc/systemd/system/itm-web-realtime.service
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-ssh-session.service" \
+    /etc/systemd/system/itm-ssh-session.service
+
+install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$SCRIPT_DIR/systemd/itm-ssh-session.timer" \
+    /etc/systemd/system/itm-ssh-session.timer
 
 # ============================================================
 # SSH LOGIN PAM ALERT
@@ -991,6 +1043,11 @@ if [[ "$INSTALL_WEB_MONITOR" == "1" ]]; then
 
     systemctl enable --now itm-web-scan.timer
 
+    # Session checking is safe to enable everywhere: the module
+    # is monitor_only until an operator changes audit.conf.
+    systemctl enable --now itm-ssh-session.timer
+    echo "[+] SSH session timer enabled (mode: $(grep -m1 '^SSH_SESSION_MODE=' "$AUDIT_CONF" 2>/dev/null | cut -d'"' -f2 || echo monitor_only))."
+
     if command -v inotifywait >/dev/null 2>&1; then
         systemctl enable --now itm-web-realtime.service
         echo "[+] Web scan timer and realtime monitor enabled."
@@ -1141,6 +1198,124 @@ check_result "Fail2Ban action:" "$F2B_BAN_ACTION"
 echo "============================================================"
 
 # ============================================================
+# POST-INSTALL VALIDATION
+#
+# An installer that prints "complete" while the monitoring is
+# dead is worse than one that fails: it produces confidence
+# without coverage. Everything below is verified to be RUNNING,
+# not merely installed, and the installer exits non-zero if a
+# required component did not come up.
+# ============================================================
+
+echo
+echo "============================================================"
+echo " Post-install validation"
+echo "============================================================"
+
+INSTALL_FAILURES=0
+INSTALL_WARNINGS=0
+
+validate() {
+    local label="$1" state="$2" detail="${3:-}"
+    printf '%-34s %-8s %s\n' "$label" "$state" "$detail"
+    case "$state" in
+        FAIL) INSTALL_FAILURES=$(( INSTALL_FAILURES + 1 )) ;;
+        WARN) INSTALL_WARNINGS=$(( INSTALL_WARNINGS + 1 )) ;;
+    esac
+}
+
+# --- services that must be running -------------------------
+for svc in security-file-monitor.service itm-command-monitor.service; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        validate "$svc" "ACTIVE"
+    else
+        validate "$svc" "FAIL" "$(systemctl is-active "$svc" 2>/dev/null | head -1)"
+    fi
+done
+
+# --- timers that must be armed -----------------------------
+for tmr in itm-security-audit.timer itm-web-scan.timer itm-ssh-session.timer; do
+    if systemctl is-active --quiet "$tmr" 2>/dev/null; then
+        validate "$tmr" "ACTIVE" \
+            "next: $(systemctl show "$tmr" -p NextElapseUSecRealtime --value 2>/dev/null | cut -c1-25)"
+    elif [[ "$INSTALL_AUDIT_TIMER" != "1" || "$INSTALL_WEB_MONITOR" != "1" ]]; then
+        validate "$tmr" "WARN" "disabled by operator"
+    else
+        validate "$tmr" "FAIL" "not active"
+    fi
+done
+
+# --- realtime watcher: not applicable on non-web hosts ------
+if systemctl is-active --quiet itm-web-realtime.service 2>/dev/null; then
+    validate "itm-web-realtime.service" "ACTIVE"
+elif command -v inotifywait >/dev/null 2>&1; then
+    validate "itm-web-realtime.service" "N/A" "no web workload on this host"
+else
+    validate "itm-web-realtime.service" "WARN" "inotify-tools missing"
+fi
+
+# --- the CLI must actually run ------------------------------
+if /usr/local/sbin/itm-security version >/dev/null 2>&1; then
+    validate "itm-security CLI" "OK" "$(/usr/local/sbin/itm-security version 2>/dev/null)"
+else
+    validate "itm-security CLI" "FAIL" "does not execute"
+fi
+
+# --- every module must load ---------------------------------
+SELFTEST_OUT="$(/usr/local/sbin/itm-security self-test 2>&1 || true)"
+if printf '%s' "$SELFTEST_OUT" | grep -q 'RESULT: READY'; then
+    validate "module self-test" "OK" "$(printf '%s' "$SELFTEST_OUT" | grep -c 'OK       syntax valid') modules loaded"
+else
+    validate "module self-test" "FAIL" "$(printf '%s' "$SELFTEST_OUT" | grep -m1 'RESULT:')"
+fi
+
+# --- prime the role cache and the run-state so the health
+#     module has something to compare against immediately ----
+if /usr/local/sbin/itm-security audit role health --quiet >/dev/null 2>&1; then
+    validate "first audit run" "OK" "role + health primed"
+else
+    validate "first audit run" "WARN" "completed with findings (expected on a live host)"
+fi
+
+# --- JSON output must be parseable by a SIEM ----------------
+if /usr/local/sbin/itm-security audit role --json --dry-run 2>/dev/null | head -1 | grep -q '^\[' ; then
+    validate "JSON output" "OK" "valid array"
+else
+    validate "JSON output" "WARN" "could not be verified"
+fi
+
+# --- evidence and state must be writable --------------------
+for d in "$AUDIT_LOG_DIR" "$AUDIT_STATE_DIR" "$WEB_EVIDENCE_DIR"; do
+    [[ -w "$d" ]] && validate "writable: $(basename "$d")" "OK" || validate "writable: $(basename "$d")" "FAIL" "$d"
+done
+
+# --- monitor health ------------------------------------------
+HEALTH_OUT="$(/usr/local/sbin/itm-security health --quiet 2>&1 || true)"
+HEALTH_RC=$?
+case "$HEALTH_RC" in
+    0) validate "monitor health" "OK" "HEALTHY" ;;
+    1) validate "monitor health" "WARN" "DEGRADED - see: itm-security health" ;;
+    *) validate "monitor health" "WARN" "see: itm-security health" ;;
+esac
+
+echo "============================================================"
+
+if (( INSTALL_FAILURES > 0 )); then
+    echo
+    echo "[ERROR] INSTALLATION INCOMPLETE: ${INSTALL_FAILURES} required component(s) are not running."
+    echo
+    echo "        This host is NOT fully monitored. Diagnose with:"
+    echo "          itm-security health"
+    echo "          journalctl -u security-file-monitor -n 50 --no-pager"
+    echo
+    exit 1
+fi
+
+if (( INSTALL_WARNINGS > 0 )); then
+    echo "[!] Installed with ${INSTALL_WARNINGS} warning(s) - review the table above."
+fi
+
+# ============================================================
 # TELEGRAM INSTALL TEST
 # ============================================================
 
@@ -1175,7 +1350,18 @@ echo "  fail2ban-client get sshd ignoreip"
 echo "  journalctl -t itm-command-monitor -n 20 --no-pager"
 echo
 
-echo "Post-compromise audit (read only, never modifies the host):"
+echo "ACTIVE NOW - nothing further is required to start monitoring:"
+echo
+echo "  realtime file monitor      : running"
+echo "  command monitor            : running"
+echo "  SSH session check          : every 1 minute   (mode: $(grep -m1 '^SSH_SESSION_MODE=' "$AUDIT_CONF" 2>/dev/null | cut -d'"' -f2 || echo monitor_only))"
+echo "  web content scan           : every 3 hours"
+echo "  full system audit          : nightly 03:15"
+echo "  Telegram alerts            : HIGH and CRITICAL, deduplicated"
+echo
+echo "  systemctl list-timers 'itm-*'"
+echo
+echo "Manual commands (optional - the schedule already covers these):"
 echo
 echo "  itm-security self-test"
 echo "  itm-security audit --dry-run     # writes nothing, sends nothing"
@@ -1190,6 +1376,17 @@ echo "  systemctl status itm-web-realtime --no-pager"
 echo "  systemctl list-timers itm-web-scan.timer"
 echo "  systemctl list-timers itm-security-audit.timer"
 echo "  less $AUDIT_LOG_DIR/post-compromise-audit.log"
+echo
+
+echo "ONE THING THAT IS DELIBERATELY NOT AUTOMATIC:"
+echo
+echo "  itm-security web baseline"
+echo
+echo "  The integrity baseline is NOT taken during installation on purpose."
+echo "  A baseline records the current state as normal. Taking it automatically"
+echo "  on a host that may already be compromised would record the intruder's"
+echo "  files as legitimate, and every future comparison would agree with them."
+echo "  Run it once you are satisfied the application source is trustworthy."
 echo
 
 echo "IMPORTANT - host trust:"

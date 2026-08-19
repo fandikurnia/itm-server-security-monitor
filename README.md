@@ -330,6 +330,45 @@ The sweep walks the system binary directories only (not the whole filesystem),
 resolves package ownership in batched queries, and is part of the nightly audit
 rather than the three-hourly web scan.
 
+### IOC database and incident sweeps
+
+`/etc/security-monitor/ioc/known-iocs.conf` turns one host's incident into
+fleet-wide detection. Five indicator types, each with a different consequence:
+
+| Type | Checked how | Result |
+|---|---|---|
+| `path:` | exact absolute path | **CRITICAL** if the hash also matches, **HIGH** ("suspicious artifact") if the name matches but the content does not |
+| `filename:` | bounded search (`IOC_FILENAME_SEARCH_DIRS`, depth 4, timeout) | CRITICAL |
+| `sha256:` | content hash of system binaries — catches a renamed payload | CRITICAL |
+| `ip:` | live socket table via `ss` | CRITICAL only when a socket actually exists |
+| `string:` | marker in binaries, PAM, systemd, cron, web roots | CRITICAL |
+
+A configured IOC that is **not present raises nothing** — the list is a sweep,
+not a checklist to acknowledge.
+
+Structural checks that need no IOC list at all, and which catch the *next*
+payload rather than the last one:
+
+- an executable in a system binary directory that **no package owns**
+- a process whose `argv[0]` is a bracketed kernel-thread name (`[php-fpm]`) while
+  it actually has an executable — the `exec -a` disguise
+- `/etc/ld.so.preload` present at all
+
+**Anti-wrapper measure.** Everything used to *judge* the host is resolved from
+`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` — never from `PATH`. On a compromised
+host of this estate `/usr/local/bin/ps`, `/usr/local/bin/netstat` and
+`/usr/local/bin/lsof` filtered their own output, and `/usr/local/bin` precedes
+`/usr/bin` in the default `PATH`. `sha256sum`, `ss` and `ps` are therefore taken
+from a trusted directory list, not from whatever the shell would resolve.
+
+```bash
+sudo itm-security audit ioc            # ~10s, part of the nightly audit
+```
+
+Alerts deduplicate by fingerprint (which includes the file hash), so the same
+indicator does not alert every interval; a **changed hash or a raised severity
+re-alerts immediately**, and `ALERT_REPEAT_HOURS` sets the cooldown otherwise.
+
 ### Detection philosophy
 
 The audit never reports a host as CLEAN. The absence of a detection is reported

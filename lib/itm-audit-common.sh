@@ -116,7 +116,13 @@ OUTBOUND_ALLOW_PROCS="sshd apt apt-get aptd unattended-upgr packagekitd dnf yum 
 # ITM's own integrations. Listed explicitly so the allowlist is
 # itself auditable, and printed in the report.
 PAM_EXEC_ALLOW="/usr/local/sbin/ssh-login-alert"
-ITM_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-security-audit.service itm-security-audit.timer itm-web-scan.service itm-web-scan.timer itm-web-realtime.service"
+# Authoritative list of the units and binaries this project owns.
+# audit_load_config() merges these into whatever audit.conf says,
+# so an upgraded host never reports its own tooling as unknown.
+ITM_BUILTIN_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-security-audit.service itm-security-audit.timer itm-web-scan.service itm-web-scan.timer itm-web-realtime.service itm-ssh-session.service itm-ssh-session.timer"
+ITM_BUILTIN_OWN_BINARIES="/usr/local/sbin/security-notify /usr/local/sbin/ssh-login-alert /usr/local/sbin/security-file-monitor /usr/local/sbin/itm-command-relay /usr/local/sbin/itm-security /usr/local/sbin/itm-web-realtime"
+
+ITM_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-security-audit.service itm-security-audit.timer itm-web-scan.service itm-web-scan.timer itm-web-realtime.service itm-ssh-session.service itm-ssh-session.timer"
 ITM_OWN_BINARIES="/usr/local/sbin/security-notify /usr/local/sbin/ssh-login-alert /usr/local/sbin/security-file-monitor /usr/local/sbin/itm-command-relay /usr/local/sbin/itm-security /usr/local/sbin/itm-web-realtime"
 
 # Units seen in real incidents on this estate.
@@ -158,6 +164,38 @@ audit_load_config() {
             [[ -z "$line" ]] && continue
             TRUSTED_NETWORKS+=("$line")
         done < "$ITM_TRUSTED_NET_CONF"
+    fi
+
+    # ------------------------------------------------------------
+    # Self-knowledge is never delegated to the config file.
+    #
+    # audit.conf is preserved across upgrades, by design. That
+    # means a host installed months ago still lists the units
+    # that existed back then - and every unit added since is
+    # reported as unknown persistence by our own systemd module.
+    #
+    # The built-in list is therefore MERGED into whatever the
+    # operator configured, never replaced by it. An operator can
+    # still add their own entries; they just cannot end up with
+    # the tool failing to recognise itself.
+    # ------------------------------------------------------------
+
+    local own
+    for own in $ITM_BUILTIN_OWN_UNITS; do
+        [[ " $ITM_OWN_UNITS " == *" $own "* ]] || ITM_OWN_UNITS="$ITM_OWN_UNITS $own"
+    done
+    for own in $ITM_BUILTIN_OWN_BINARIES; do
+        [[ " $ITM_OWN_BINARIES " == *" $own "* ]] || ITM_OWN_BINARIES="$ITM_OWN_BINARIES $own"
+    done
+
+    # Older configurations put /home in VOLATILE_EXEC_PATHS, which
+    # made every user-owned tool a CRITICAL finding. The rule was
+    # split into two lists later. Repair the semantics here rather
+    # than editing the operator's file.
+    if [[ "$VOLATILE_EXEC_PATHS" == *"/home"* ]]; then
+        VOLATILE_EXEC_PATHS="${VOLATILE_EXEC_PATHS//\/home/}"
+        VOLATILE_EXEC_PATHS="$(printf '%s' "$VOLATILE_EXEC_PATHS" | tr -s ' ')"
+        [[ " $USER_EXEC_PATHS " == *" /home "* ]] || USER_EXEC_PATHS="$USER_EXEC_PATHS /home"
     fi
 
     # Loopback is always trusted even without a config file.
@@ -360,6 +398,56 @@ truncate_text() {
 
 have_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------
+# Trusted absolute binaries
+#
+# PATH is attacker controlled. On this estate a compromised host
+# carried /usr/local/bin/ps, /usr/local/bin/netstat and
+# /usr/local/bin/lsof that filtered their own output, and
+# /usr/local/bin precedes /usr/bin in the default PATH.
+#
+# Anything used to JUDGE the host is therefore resolved from a
+# fixed list of system directories instead of PATH. The wrapper
+# directories are deliberately excluded.
+#
+# Not hardcoded to one path: sha256sum lives in /usr/bin on
+# Debian and /bin on some others, and a hardcoded path that does
+# not exist is its own outage.
+# ------------------------------------------------------------
+
+ITM_TRUSTED_BIN_DIRS="${ITM_TRUSTED_BIN_DIRS:-/usr/bin /bin /usr/sbin /sbin}"
+
+declare -A ITM_TRUSTED_BIN_CACHE=()
+
+trusted_bin() {
+
+    local name="$1" dir candidate
+
+    if [[ -n "${ITM_TRUSTED_BIN_CACHE[$name]:-}" ]]; then
+        printf '%s' "${ITM_TRUSTED_BIN_CACHE[$name]}"
+        return 0
+    fi
+
+    for dir in $ITM_TRUSTED_BIN_DIRS; do
+        candidate="$dir/$name"
+        if [[ -x "$candidate" && ! -L "$candidate" ]] || [[ -x "$candidate" ]]; then
+            ITM_TRUSTED_BIN_CACHE["$name"]="$candidate"
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# sha256 of a file using the trusted binary, never PATH.
+trusted_sha256() {
+    local path="$1" bin
+    [[ -r "$path" ]] || { printf 'unreadable'; return 0; }
+    bin="$(trusted_bin sha256sum)" || { printf 'sha256sum-missing'; return 0; }
+    "$bin" -- "$path" 2>/dev/null | awk '{print $1}'
 }
 
 # Run a command with a wall clock limit. Missing timeout(1) is

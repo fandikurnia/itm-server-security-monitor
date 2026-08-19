@@ -126,7 +126,7 @@ OUTBOUND_ALLOW_PROCS="sshd apt apt-get aptd unattended-upgr packagekitd dnf yum 
 
 PAM_EXEC_ALLOW="/usr/local/sbin/ssh-login-alert"
 
-ITM_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-security-audit.service itm-security-audit.timer itm-web-scan.service itm-web-scan.timer itm-web-realtime.service"
+ITM_OWN_UNITS="security-file-monitor.service itm-command-monitor.service itm-security-audit.service itm-security-audit.timer itm-web-scan.service itm-web-scan.timer itm-web-realtime.service itm-ssh-session.service itm-ssh-session.timer"
 
 ITM_OWN_BINARIES="/usr/local/sbin/security-notify /usr/local/sbin/ssh-login-alert /usr/local/sbin/security-file-monitor /usr/local/sbin/itm-command-relay /usr/local/sbin/itm-security /usr/local/sbin/itm-web-realtime"
 

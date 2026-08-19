@@ -48,7 +48,7 @@ ITM_MANIFEST="${ITM_MANIFEST:-/var/lib/itm-security/manifest.sha256}"
 HEALTH_REQUIRED_BINARIES="${HEALTH_REQUIRED_BINARIES:-/usr/local/sbin/security-notify /usr/local/sbin/itm-security}"
 HEALTH_REQUIRED_SERVICES="${HEALTH_REQUIRED_SERVICES:-security-file-monitor.service}"
 HEALTH_OPTIONAL_SERVICES="${HEALTH_OPTIONAL_SERVICES:-itm-command-monitor.service itm-web-realtime.service}"
-HEALTH_TIMERS="${HEALTH_TIMERS:-itm-security-audit.timer itm-web-scan.timer}"
+HEALTH_TIMERS="${HEALTH_TIMERS:-itm-security-audit.timer itm-web-scan.timer itm-ssh-session.timer}"
 
 HEALTH_STATE="HEALTHY"
 HEALTH_BROKEN=0

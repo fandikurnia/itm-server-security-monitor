@@ -73,3 +73,68 @@ string:/sudo/socket.php
 # ------------------------------------------------------------
 
 # path:/usr/bin/<payload name once recovered>
+
+
+# ============================================================
+# INCIDENT: Fileshare Kemenpora, 2026-08
+#
+# gsocket family implant with systemd persistence, forensic
+# command wrappers, a PAM credential hook and a live C2 channel.
+#
+# Indicator types used below:
+#   path:      exact absolute path        -> CRITICAL if hash matches,
+#                                            HIGH if the name matches
+#                                            but the hash does not
+#   filename:  name searched in a bounded
+#              set of directories         -> CRITICAL
+#   sha256:    content hash, any name     -> CRITICAL
+#   ip:        C2 address, checked with
+#              ss from a trusted path     -> CRITICAL if a socket exists
+#   string:    marker in config/binaries  -> CRITICAL
+# ============================================================
+
+# --- payload binaries ---
+path:/usr/bin/defaults
+path:/usr/bin/security
+path:/usr/bin/stderr.q
+path:/usr/bin/kemenpora
+
+# --- forensic command wrappers (also covered by the command module) ---
+path:/usr/local/bin/ps
+path:/usr/local/bin/netstat
+path:/usr/local/bin/lsof
+
+# --- systemd persistence and its key material ---
+path:/lib/systemd/system/defaults.service
+path:/usr/lib/systemd/system/defaults.service
+path:/lib/systemd/system/defaults.dat
+path:/usr/lib/systemd/system/defaults.dat
+path:/etc/systemd/system/server-security.service
+path:/etc/systemd/system/multi-user.target.wants/defaults.service
+
+# --- names hunted in the bounded search directories ---
+filename:x86_65-linux-gnu-op
+filename:kiann.php
+
+# --- payload hashes (a renamed copy is still detected) ---
+sha256:cb5f62bf7b591e69bd38e6bf8e40e8d307d154b2935703422d44f02e403d2e78
+sha256:9ee24677dc023cc5e17faef0f20ca0b384ec4222e7d7f0480dcc3e7e21a96f25
+sha256:11f3a87b4bca66482847f552177a06918ae47fdd76c242d89762d22f1994a389
+sha256:f92879c372659231f213fae4f26b42075c0bf48219d12931de0b857ef6ccdf52
+sha256:d94f75a70b5cabaf786ac57177ed841732e62bdcc9a29e06e5b41d9be567bcfa
+sha256:347f9c29f2de4bd4c9d06a4566b80ce7b4394984eeebf333aef36664bd864776
+
+# --- command and control ---
+ip:167.71.214.178
+
+# --- configuration markers ---
+string:GS_HOST
+string:GS_ARGS
+string:defaults.dat
+string:/usr/bin/defaults
+string:server-security.service
+string:x86_65-linux-gnu-op
+
+# Process masquerading as a kernel thread is detected
+# structurally (bracketed argv[0] with a real executable), so it
+# needs no string entry here.

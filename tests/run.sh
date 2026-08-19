@@ -455,6 +455,154 @@ test_remediation() {
 }
 
 # ============================================================
+# TEST: Fileshare Kemenpora IOC detection
+#
+# The nine cases the operator asked for, each against a real
+# file on disk in the sandbox - no mocking of the filesystem.
+# ============================================================
+
+ioc_run() {
+    env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        IOC_SYSTEM_BIN_DIRS="$CASE_DIR/fakebin" \
+        IOC_SEARCH_CONFIG_DIRS="$CASE_DIR/etc" \
+        IOC_FILENAME_SEARCH_DIRS="$CASE_DIR/hunt" \
+        "$@" \
+        timeout 180 "$REPO_DIR/bin/itm-security" audit ioc --dry-run 2>&1
+}
+
+test_ioc_kemenpora() {
+
+    want "ioc-kemenpora" || return 0
+    printf '\nTEST: Fileshare Kemenpora IOC detection\n'
+
+    setup_case ioc-kemenpora
+    mkdir -p "$CASE_DIR"/{fakebin,etc,hunt,real}
+
+    # --- payload with a KNOWN hash -------------------------------
+    printf 'PAYLOAD-A\n' > "$CASE_DIR/real/payload"
+    local known_sha
+    known_sha="$(sha256sum "$CASE_DIR/real/payload" | awk '{print $1}')"
+
+    # --- same NAME, different content ----------------------------
+    printf 'a completely different file\n' > "$CASE_DIR/real/impostor"
+
+    # --- symlink pointing at the payload -------------------------
+    ln -sf "$CASE_DIR/real/payload" "$CASE_DIR/real/link-to-payload"
+
+    # --- unreadable file -----------------------------------------
+    printf 'secret\n' > "$CASE_DIR/real/noaccess"
+    chmod 000 "$CASE_DIR/real/noaccess"
+
+    # --- IOC filename in the hunt directory ----------------------
+    printf 'dropped\n' > "$CASE_DIR/hunt/x86_65-linux-gnu-op"
+
+    # --- PAM file with expose_authtok ----------------------------
+    printf 'auth optional pam_exec.so expose_authtok /usr/bin/defaults\n' \
+        > "$CASE_DIR/etc/common-auth"
+
+    cat > "$CASE_DIR/conf/ioc/known-iocs.conf" <<EOI
+path:$CASE_DIR/real/payload
+path:$CASE_DIR/real/impostor
+path:$CASE_DIR/real/link-to-payload
+path:$CASE_DIR/real/noaccess
+path:$CASE_DIR/real/does-not-exist
+filename:x86_65-linux-gnu-op
+sha256:$known_sha
+ip:203.0.113.199
+string:GS_ARGS
+EOI
+
+    local out
+    out="$(ioc_run)"
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    # 1. file absent -> no alert at all
+    ! printf '%s' "$out" | grep -q 'does-not-exist'
+    check "1. IOC path that does not exist raises NO alert" "$?"
+
+    # 2. name matches, hash does not -> HIGH suspicious artifact
+    printf '%s' "$out" | grep -B2 'impostor' | grep -qE '^\[HIGH.*Suspicious artifact'
+    check "2. IOC filename with a DIFFERENT hash = HIGH suspicious artifact" "$?"
+
+    # 3. hash matches -> CRITICAL
+    printf '%s' "$out" | grep -B2 "real/payload" | grep -qE '^\[CRITICAL'
+    check "3. IOC hash match = CRITICAL" "$?"
+
+    # 4. symlink is reported and identified as a symlink
+    printf '%s' "$out" | grep -q 'symlink=yes'
+    check "4. symlink IOC is detected and flagged as a symlink" "$?"
+
+    # 5. permission denied -> still alerted, marked unreadable
+    printf '%s' "$out" | grep -q 'noaccess'
+    check "5. unreadable IOC file still raises an alert" "$?"
+
+    # 6. filename hunt in bounded directories
+    printf '%s' "$out" | grep -q 'x86_65-linux-gnu-op'
+    check "6. IOC filename found by the bounded hunt" "$?"
+
+    # 7. C2 IP configured but not connected -> no false alert
+    ! printf '%s' "$out" | grep -q '203.0.113.199.*CRITICAL'
+    check "7. configured C2 with no active socket raises no alert" "$?"
+
+    # 8. nothing sensitive leaked into the output
+    ! printf '%s' "$out" | grep -qi 'BOT_TOKEN=[0-9]\|PRIVATE KEY\|password=[^ ]'
+    check "8. no secret material appears in the findings" "$?"
+
+    chmod 644 "$CASE_DIR/real/noaccess" 2>/dev/null || true
+}
+
+test_ioc_pam_and_dedup() {
+
+    want "ioc-pam" || return 0
+    printf '\nTEST: PAM IOC and alert deduplication\n'
+
+    setup_case ioc-pam
+    mkdir -p "$CASE_DIR/pamd"
+    printf 'auth optional pam_exec.so quiet expose_authtok /usr/bin/x86_65-linux-gnu-op\n' \
+        > "$CASE_DIR/pamd/common-auth"
+
+    local out
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        PAM_DIR="$CASE_DIR/pamd" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit pam --dry-run 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -qE '^\[CRITICAL.*credential stealer'
+    check "9a. pam_exec + expose_authtok = CRITICAL" "$?"
+
+    # --- deduplication: same finding, second run inside cooldown
+    local tg="$CASE_DIR/tg.log"
+    cat > "$CASE_DIR/notify" <<'EON'
+#!/usr/bin/env bash
+printf 'ALERT\n' >> "${TG_LOG:?}"
+EON
+    chmod +x "$CASE_DIR/notify"
+    : > "$tg"
+
+    local i
+    for i in 1 2 3; do
+        env \
+            ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+            ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+            ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+            PAM_DIR="$CASE_DIR/pamd" ITM_NOTIFY_BIN="$CASE_DIR/notify" TG_LOG="$tg" \
+            timeout 120 "$REPO_DIR/bin/itm-security" audit pam --telegram --quiet >/dev/null 2>&1
+    done
+
+    local sent
+    sent="$(grep -c ALERT "$tg" 2>/dev/null || echo 0)"
+    (( sent <= 1 ))
+    check "9b. three identical runs send at most ONE alert (dedup)" "$?" "sent=$sent"
+}
+
+# ============================================================
 # TEST: installer well-formedness
 #
 # bash -n accepts an install(1) call with a source but no
@@ -836,6 +984,8 @@ test_remediation
 test_health
 test_cron
 test_self_protection
+test_ioc_kemenpora
+test_ioc_pam_and_dedup
 test_installer
 test_ssh_session
 test_ssh_enforce
