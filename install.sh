@@ -1230,8 +1230,10 @@ fi
 IOC_FOUND="$(find "$AUDIT_IOC_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)"
 check_result "IOC lists:" "$IOC_FOUND / ${#AUDIT_IOC_FILES[@]}"
 
-HOST_ROLE_LINE="$(/usr/local/sbin/itm-security audit role --dry-run --quiet 2>/dev/null | grep -m1 'host role:' || true)"
-check_result "Host role:" "${HOST_ROLE_LINE#*host role: }"
+# --quiet suppresses exactly the line this greps for.
+HOST_ROLE_LINE="$(/usr/local/sbin/itm-security audit role --dry-run 2>/dev/null | grep -m1 'host role:' || true)"
+HOST_ROLE_LINE="${HOST_ROLE_LINE#*host role: }"
+check_result "Host role:" "${HOST_ROLE_LINE:-not determined}"
 
 check_result "Host trust status:" \
     "$(grep -E '^HOST_TRUST_STATUS=' "$AUDIT_CONF" 2>/dev/null | cut -d'"' -f2 || echo UNVERIFIED)"
@@ -1282,8 +1284,11 @@ done
 # --- timers that must be armed -----------------------------
 for tmr in itm-security-audit.timer itm-web-scan.timer itm-ssh-session.timer; do
     if systemctl is-active --quiet "$tmr" 2>/dev/null; then
-        validate "$tmr" "ACTIVE" \
-            "next: $(systemctl show "$tmr" -p NextElapseUSecRealtime --value 2>/dev/null | cut -c1-25)"
+        # A monotonic timer (OnUnitActiveSec) has no realtime
+        # next-elapse value; list-timers resolves both kinds.
+        TMR_NEXT="$(systemctl list-timers "$tmr" --no-legend --no-pager 2>/dev/null | awk '{print $1, $2, $3}')"
+        [[ -n "$TMR_NEXT" ]] || TMR_NEXT="$(systemctl show "$tmr" -p NextElapseUSecRealtime --value 2>/dev/null | cut -c1-25)"
+        validate "$tmr" "ACTIVE" "next: ${TMR_NEXT:-scheduled}"
     elif [[ "$INSTALL_AUDIT_TIMER" != "1" || "$INSTALL_WEB_MONITOR" != "1" ]]; then
         validate "$tmr" "WARN" "disabled by operator"
     else
@@ -1324,10 +1329,25 @@ else
 fi
 
 # --- JSON output must be parseable by a SIEM ----------------
-if /usr/local/sbin/itm-security audit role --json --dry-run 2>/dev/null | head -1 | grep -q '^\[' ; then
-    validate "JSON output" "OK" "valid array"
+#
+# Captured into a variable rather than piped into head: this
+# script runs under "set -o pipefail", and head closing the pipe
+# early makes the producer exit on SIGPIPE (141), which would
+# report a perfectly good JSON document as unverifiable.
+JSON_OUT="$(/usr/local/sbin/itm-security audit role --json --dry-run 2>/dev/null || true)"
+
+if [[ "${JSON_OUT:0:1}" == "[" ]] && [[ "$JSON_OUT" == *'"module":"role"'* ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+        if printf '%s' "$JSON_OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+            validate "JSON output" "OK" "valid, parsed"
+        else
+            validate "JSON output" "FAIL" "produced but does not parse"
+        fi
+    else
+        validate "JSON output" "OK" "valid array (structure checked)"
+    fi
 else
-    validate "JSON output" "WARN" "could not be verified"
+    validate "JSON output" "WARN" "no JSON produced"
 fi
 
 # --- evidence and state must be writable --------------------
