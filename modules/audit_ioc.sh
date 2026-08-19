@@ -51,6 +51,12 @@ KNOWN_IOCS=()
 #   string:/sudo/socket.php
 # ------------------------------------------------------------
 
+pid_owner() {
+    local pid="$1"
+    proc_read_status "$pid" 2>/dev/null || { printf 'unknown'; return 0; }
+    uid_to_name "$PROC_UID"
+}
+
 ioc_load_database() {
     load_ioc_list "known-iocs.conf" KNOWN_IOCS || return 1
     (( ${#KNOWN_IOCS[@]} > 0 ))
@@ -175,28 +181,81 @@ Strings of interest: $(run_timeout 10 strings -n 6 "$file" 2>/dev/null | grep -E
 
 ioc_check_known_paths() {
 
-    local path found=0
+    local path found=0 sha sha2 known_hashes h is_known
+
+    # The hash list is loaded once so a path finding can say
+    # whether the file IS the known payload, or merely carries
+    # its name.
+    known_hashes="$(ioc_entries_of_type sha256 | tr 'A-Z' 'a-z' | tr '\n' ' ')"
 
     while IFS= read -r path; do
 
         [[ -n "$path" ]] || continue
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
 
         found=$(( found + 1 ))
 
-        add_finding CRITICAL \
-            "Known malicious file from a previous incident is present on this host" \
-            id="ioc-known-path:$path" \
-            path="$path" \
-            hash="$(file_sha256 "$path")" \
-            confidence=99 \
+        local is_link="no" link_target=""
+        if [[ -L "$path" ]]; then
+            is_link="yes"
+            link_target="$(readlink -f -- "$path" 2>/dev/null || readlink -- "$path" 2>/dev/null)"
+        fi
+
+        sha="$(trusted_sha256 "$path")"
+
+        # A file that changes between two reads is being written
+        # while it is examined: report the fact rather than a
+        # hash that describes neither version.
+        local changed="no"
+        if [[ "$sha" != "unreadable" && "$sha" != "sha256sum-missing" ]]; then
+            sha2="$(trusted_sha256 "$path")"
+            [[ "$sha" == "$sha2" ]] || changed="yes"
+        fi
+
+        is_known="no"
+        if [[ -n "$sha" && "$sha" != "unreadable" ]]; then
+            for h in $known_hashes; do
+                [[ "${sha,,}" == "$h" ]] && { is_known="yes"; break; }
+            done
+        fi
+
+        local severity title reasons
+        if [[ "$is_known" == "yes" ]]; then
+            severity=CRITICAL
+            title="Known malicious file from a previous incident is present on this host"
             reasons="Path matches an IOC recorded from a confirmed compromise on this estate
-The file exists on this host right now" \
-            evidence="owner=$(stat -Lc '%U:%G' "$path" 2>/dev/null) mode=$(stat -Lc '%a' "$path" 2>/dev/null) size=$(stat -Lc '%s' "$path" 2>/dev/null)
-mtime=$(file_mtime_human "$path")
-sha256=$(file_sha256 "$path")
+Content hash matches the recorded payload exactly
+This is the same binary, not a coincidence of naming"
+        elif [[ "$sha" == "unreadable" ]]; then
+            severity=HIGH
+            title="IOC path exists but could not be read"
+            reasons="Path matches a known IOC from a confirmed compromise
+The file could not be read to confirm its hash (permission denied or a special file)
+Presence at this exact path is itself the indicator"
+        else
+            severity=HIGH
+            title="Suspicious artifact: IOC filename present with an unrecognised hash"
+            reasons="Path matches a known IOC from a confirmed compromise
+The content hash does NOT match any recorded payload
+This is either a different build of the same implant, or an unrelated file that happens to occupy the path"
+        fi
+
+        [[ "$is_link" == "yes" ]] && reasons+="
+The path is a SYMLINK to ${link_target:-unknown} - the target is what executes"
+        [[ "$changed" == "yes" ]] && reasons+="
+The file CHANGED between two consecutive reads: it is being written to right now"
+
+        add_finding "$severity" "$title" \
+            id="ioc-known-path:$path" \
+            event=IOC_KNOWN_PATH \
+            path="$path" \
+            hash="$sha" \
+            confidence="$( [[ "$is_known" == yes ]] && echo 99 || echo 80 )" \
+            reasons="$reasons" \
+            evidence="sha256=$sha hash_matches_known_ioc=$is_known symlink=$is_link${link_target:+ -> $link_target} changed_while_reading=$changed
+owner=$(stat -Lc '%U:%G' "$path" 2>/dev/null) mode=$(stat -Lc '%a' "$path" 2>/dev/null) size=$(stat -Lc '%s' "$path" 2>/dev/null) mtime=$(file_mtime_human "$path")
 package=$(pkg_owner "$path")" \
-            action="ISOLATE THIS HOST. Preserve the file and its metadata before anything else. Rotate every credential used on this host. Then find how it got here and what re-installs it - the payload is the symptom, the persistence is the problem."
+            action="ISOLATE THIS HOST. Preserve the file and its metadata before anything else. Rotate every credential used on this host. Then find how it got here and what re-installs it - the payload is the symptom, the persistence is the problem. If root compromise is confirmed, rebuild from trusted media."
 
         evidence_snapshot "$path" \
             "$(printf '%s|ioc-known|%s' "$ITM_HOSTNAME" "$path" | sha256sum | cut -c1-32)" \
@@ -205,6 +264,184 @@ package=$(pkg_owner "$path")" \
     done < <(ioc_entries_of_type path)
 
     (( found == 0 )) && add_pass "no known IOC file path present on this host"
+}
+
+# ------------------------------------------------------------
+# IOC filenames anywhere in a BOUNDED set of directories
+#
+# "x86_65-linux-gnu-op" and "kiann.php" are names, not paths.
+# Searching the whole filesystem every interval is exactly the
+# behaviour this project refuses, so the hunt is limited to the
+# directories a dropped payload actually lands in, with a depth
+# limit and a timeout.
+# ------------------------------------------------------------
+
+IOC_FILENAME_SEARCH_DIRS="${IOC_FILENAME_SEARCH_DIRS:-/usr/bin /usr/sbin /bin /sbin /usr/local /opt /tmp /var/tmp /dev/shm /root /etc /var/www /website /srv}"
+IOC_FILENAME_MAXDEPTH="${IOC_FILENAME_MAXDEPTH:-4}"
+
+ioc_check_ioc_filenames() {
+
+    local names=() n found=0 hit
+
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && names+=("$n")
+    done < <(ioc_entries_of_type filename)
+
+    (( ${#names[@]} > 0 )) || { add_skip "no IOC filenames configured"; return 0; }
+
+    local -a name_args=()
+    local first=1
+    for n in "${names[@]}"; do
+        (( first )) || name_args+=( -o )
+        name_args+=( -name "$n" )
+        first=0
+    done
+
+    local -a dirs=()
+    for n in $IOC_FILENAME_SEARCH_DIRS; do
+        [[ -d "$n" ]] && dirs+=("$n")
+    done
+    (( ${#dirs[@]} > 0 )) || return 0
+
+    while IFS= read -r hit; do
+
+        [[ -n "$hit" ]] || continue
+        found=$(( found + 1 ))
+
+        local sha
+        sha="$(trusted_sha256 "$hit")"
+
+        add_finding CRITICAL \
+            "File matching a known IOC filename" \
+            id="ioc-filename:$hit" \
+            event=IOC_KNOWN_FILENAME \
+            path="$hit" \
+            hash="$sha" \
+            confidence=95 \
+            reasons="Filename matches an artefact recovered from a confirmed compromise
+The name imitates a toolchain or application file so it reads as ordinary in a directory listing
+Found outside the paths previously recorded, which means it was dropped again or was missed" \
+            evidence="owner=$(stat -Lc '%U:%G' "$hit" 2>/dev/null) mode=$(stat -Lc '%a' "$hit" 2>/dev/null) size=$(stat -Lc '%s' "$hit" 2>/dev/null)
+mtime=$(file_mtime_human "$hit") sha256=$sha package=$(pkg_owner "$hit")" \
+            action="ISOLATE THIS HOST and preserve the file. Search for what wrote it (cron, systemd, PAM, web upload) before removing anything."
+
+        evidence_snapshot "$hit" \
+            "$(printf '%s|ioc-filename|%s' "$ITM_HOSTNAME" "$hit" | sha256sum | cut -c1-32)" \
+            "IOC filename hunt" >/dev/null
+
+    done < <(run_scan "$FIND_TIMEOUT" find "${dirs[@]}" -maxdepth "$IOC_FILENAME_MAXDEPTH" \
+                -type f \( "${name_args[@]}" \) -print 2>/dev/null | head -50)
+
+    (( found == 0 )) && add_pass "no file matching a known IOC filename in the searched directories"
+}
+
+# ------------------------------------------------------------
+# Active connection to a known C2 address
+#
+# ss is resolved from a trusted directory: on a host with a
+# wrapped netstat/ss the output of the PATH version cannot be
+# used to decide whether a C2 session exists.
+# ------------------------------------------------------------
+
+ioc_check_c2_connections() {
+
+    local ips=() ip found=0 ss_bin out line
+
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] && ips+=("$ip")
+    done < <(ioc_entries_of_type ip)
+
+    (( ${#ips[@]} > 0 )) || { add_skip "no IOC IP addresses configured"; return 0; }
+
+    ss_bin="$(trusted_bin ss)" || { add_skip "ss not found in a trusted directory - C2 connection check skipped"; return 0; }
+
+    out="$(run_timeout "$CMD_TIMEOUT" "$ss_bin" -tunap 2>/dev/null)"
+    [[ -n "$out" ]] || { add_skip "socket table unavailable"; return 0; }
+
+    for ip in "${ips[@]}"; do
+
+        while IFS= read -r line; do
+
+            [[ -n "$line" ]] || continue
+            found=$(( found + 1 ))
+
+            local state peer proc pid port
+            state="$(printf '%s' "$line" | awk '{print $2}')"
+            peer="$(printf '%s' "$line"  | awk '{print $6}')"
+            port="${peer##*:}"
+            proc="$(printf '%s' "$line" | grep -oE 'users:\(\("[^"]+"' | head -1 | sed 's/.*"\(.*\)"/\1/')"
+            pid="$(printf '%s' "$line" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+
+            add_finding CRITICAL \
+                "Active network connection to a known command-and-control address" \
+                id="ioc-c2-connection:$ip:${proc:-unknown}" \
+                event=IOC_C2_CONNECTION \
+                confidence=99 \
+                reasons="Remote address ${ip} is recorded as C2 infrastructure from a confirmed compromise
+A socket to it exists on this host right now
+This is live attacker communication, not a historical artefact" \
+                network="${state} -> ${peer} (port ${port})" \
+                process="$( [[ -n "$pid" ]] && printf 'pid=%s comm=%s exe=%s user=%s' "$pid" "${proc:-unknown}" "$(readlink "/proc/$pid/exe" 2>/dev/null)" "$(pid_owner "$pid")" || printf 'process not attributable' )" \
+                evidence="$(truncate_text "$(redact "$line")" 300)" \
+                action="ISOLATE THIS HOST NOW - block the address at the perimeter first so the session is cut without warning the operator of the implant. Do not kill the process before capturing it. Preserve /proc/PID, then rotate every credential used on this host."
+
+        done < <(printf '%s' "$out" | grep -F "$ip")
+    done
+
+    (( found == 0 )) && add_pass "no active connection to any known C2 address (${#ips[@]} checked)"
+}
+
+# ------------------------------------------------------------
+# argv[0] masquerading
+#
+# The implant on this estate ran as:
+#   exec -a '[php-fpm]' /usr/bin/defaults
+#
+# Brackets make a process look like a kernel thread in ps
+# output. A kernel thread has no executable, so a bracketed
+# name with a real exe behind it is a contradiction.
+# ------------------------------------------------------------
+
+ioc_check_argv_masquerade() {
+
+    local pid cmdline argv0 exe found=0
+
+    while IFS= read -r pid; do
+
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+        argv0="${cmdline%% *}"
+
+        [[ "$argv0" == \[*\]* ]] || continue
+
+        # A real kernel thread has no exe link at all.
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
+        [[ -n "$exe" ]] || continue
+
+        found=$(( found + 1 ))
+
+        proc_read_status "$pid" || true
+
+        add_finding CRITICAL \
+            "Process disguised as a kernel thread" \
+            id="ioc-argv-masquerade:$exe" \
+            event=IOC_PROCESS_MASQUERADE \
+            path="$exe" \
+            hash="$(trusted_sha256 "$exe")" \
+            confidence=95 \
+            reasons="argv[0] is ${argv0}, which reads as a kernel thread in ps output
+A kernel thread has no executable, but this process does: ${exe}
+Renaming a process this way has no legitimate use; it is done with exec -a to hide" \
+            process="pid=$pid ppid=${PROC_PPID:-?} user=$(uid_to_name "${PROC_UID:-}") exe=$exe
+cmdline=$(truncate_text "$(redact "$cmdline")" 200)" \
+            evidence="exe package=$(pkg_owner "$exe") sha256=$(trusted_sha256 "$exe")
+mtime=$(file_mtime_human "$exe")" \
+            action="Do not kill the process yet. Capture /proc/$pid/exe, cmdline, maps and open sockets, then isolate the host. Check which systemd unit or cron entry starts it."
+
+    done < <(find /proc -maxdepth 1 -regex '/proc/[0-9]+' -printf '%f\n' 2>/dev/null)
+
+    (( found == 0 )) && add_pass "no process disguised with a bracketed kernel-thread name"
 }
 
 # ------------------------------------------------------------
@@ -391,13 +628,16 @@ run_audit_ioc() {
     if ioc_load_database; then
         add_pass "IOC database loaded (${#KNOWN_IOCS[@]} indicators)"
         ioc_check_known_paths
+        ioc_check_ioc_filenames
         ioc_check_known_hashes
         ioc_check_known_strings
+        ioc_check_c2_connections
     else
         add_skip "no IOC database at ${ITM_IOC_DIR}/known-iocs.conf - generic checks still run"
     fi
 
     ioc_check_unpackaged_system_binaries
+    ioc_check_argv_masquerade
     ioc_check_ld_preload
 
     module_end

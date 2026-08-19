@@ -102,6 +102,8 @@ remove_marker_block() {
 echo "[+] Stopping services..."
 
 for unit in \
+    itm-ssh-session.timer \
+    itm-ssh-session.service \
     itm-web-realtime.service \
     itm-web-scan.timer \
     itm-web-scan.service \

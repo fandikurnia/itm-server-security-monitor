@@ -1,0 +1,30 @@
+[Unit]
+Description=ITM SSH Session Control (monitor_only by default)
+Documentation=https://github.com/YOUR-ORG/itm-server-security-monitor
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=oneshot
+
+# Only the session module: this runs frequently, so it must stay
+# cheap. loginctl plus /proc, no filesystem scanning.
+#
+# Whether anything is terminated is decided by ssh_session_mode
+# in /etc/security-monitor/audit.conf, NOT by this unit.
+# The default is monitor_only.
+ExecStart=/usr/local/sbin/itm-security audit ssh_session --telegram --quiet
+
+User=root
+Group=root
+
+SuccessExitStatus=0 2 3
+
+Nice=10
+TimeoutStartSec=120
+
+NoNewPrivileges=true
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

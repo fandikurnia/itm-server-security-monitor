@@ -1,0 +1,22 @@
+[Unit]
+Description=ITM SSH session check every minute
+Documentation=https://github.com/YOUR-ORG/itm-server-security-monitor
+
+[Timer]
+# A three hour limit does not need one minute granularity to be
+# correct, but it does need it to be RESPONSIVE: with a five
+# minute timer a session is cut up to five minutes late. One
+# minute matches ssh_session_check_interval_seconds.
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+# Deliberately NOT Persistent: a missed session check has no
+# value after the fact, unlike a missed security scan. Catching
+# up on 200 skipped runs after a reboot would achieve nothing.
+Persistent=false
+
+Unit=itm-ssh-session.service
+
+[Install]
+WantedBy=timers.target
