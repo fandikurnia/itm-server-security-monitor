@@ -49,8 +49,20 @@
 #
 # The payload name imitates the Debian toolchain triplet:
 #
-#   real    x86_64-linux-gnu-*
-#   payload x86_65-linux-gnu-op      <- 4 changed to 5
+#   real     x86_64-linux-gnu-gcc, -ld, -objdump, -strip ...
+#   payload  x86_65-linux-gnu-op      <- 4 changed to 5
+#   payload  x86_64-linux-gnu-op      <- spelled correctly
+#
+# TWO variants of the same payload have been recovered, and a
+# host carried both at once. The second spells the triplet
+# correctly and only the tool suffix is invented, so it survives
+# a reader who scans the list for a typo and finds none. There is
+# no toolchain program called "-op": the real suffixes are gcc,
+# g++, ld, as, ar, nm, objdump, objcopy, strip, ranlib, readelf,
+# size, strings, addr2line, c++filt, gcov, gprof and elfedit.
+#
+# Treat the correctly spelled variant as the more dangerous one.
+# It is what an attacker writes after the first version is found.
 #
 # By the time it was found the PAM line had been COMMENTED OUT
 # while the payload was left in place, so every check that only
@@ -58,10 +70,13 @@
 #
 # The dormant-hook check in the PAM module and the unpackaged
 # binary sweep in the IOC module both exist because of this
-# incident.
+# incident. Neither depends on the entries below: the sweep
+# reports ANY unpackaged binary in a system directory, which is
+# what catches variant three.
 # ------------------------------------------------------------
 
 path:/usr/bin/x86_65-linux-gnu-op
+path:/usr/bin/x86_64-linux-gnu-op
 
 domain:petupmanluy.xyz
 
@@ -124,6 +139,7 @@ path:/etc/systemd/system/multi-user.target.wants/defaults.service
 
 # --- names hunted in the bounded search directories ---
 filename:x86_65-linux-gnu-op
+filename:x86_64-linux-gnu-op
 filename:kiann.php
 
 # --- payload hashes (a renamed copy is still detected) ---
@@ -144,6 +160,7 @@ string:defaults.dat
 string:/usr/bin/defaults
 string:server-security.service
 string:x86_65-linux-gnu-op
+string:x86_64-linux-gnu-op
 
 # Process masquerading as a kernel thread is detected
 # structurally (bracketed argv[0] with a real executable), so it

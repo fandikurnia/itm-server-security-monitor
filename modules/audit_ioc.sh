@@ -269,8 +269,30 @@ ioc_check_known_paths() {
             done
         fi
 
+        # A symlink to /dev/null under a systemd unit directory is
+        # a MASKED unit: systemd refuses to start it at all. That
+        # is a containment measure, usually applied by whoever
+        # responded to the incident.
+        #
+        # Reporting it as a malicious artifact invites the worst
+        # possible response - quarantining the symlink REMOVES the
+        # mask and makes the unit startable again.
+        local is_masked="no"
+        if [[ "$is_link" == "yes" && "$link_target" == "/dev/null" ]] \
+           && [[ "$path" == */systemd/system/* ]]; then
+            is_masked="yes"
+        fi
+
         local severity title reasons
-        if [[ "$is_known" == "yes" ]]; then
+        if [[ "$is_masked" == "yes" ]]; then
+            severity=LOW
+            title="Known IOC unit name is present but MASKED (symlink to /dev/null)"
+            reasons="The unit name matches an IOC from a confirmed compromise
+It is a symlink to /dev/null, which is how systemd MASKS a unit: it cannot be started
+This is a containment measure, not the implant itself
+Do NOT quarantine this symlink - removing it UNMASKS the unit and makes it startable again
+The mask records that this host was compromised; keep it until the host is rebuilt"
+        elif [[ "$is_known" == "yes" ]]; then
             severity=CRITICAL
             title="Known malicious file from a previous incident is present on this host"
             reasons="Path matches an IOC recorded from a confirmed compromise on this estate
@@ -290,10 +312,17 @@ The content hash does NOT match any recorded payload
 This is either a different build of the same implant, or an unrelated file that happens to occupy the path"
         fi
 
-        [[ "$is_link" == "yes" ]] && reasons+="
+        [[ "$is_link" == "yes" && "$is_masked" == "no" ]] && reasons+="
 The path is a SYMLINK to ${link_target:-unknown} - the target is what executes"
         [[ "$changed" == "yes" ]] && reasons+="
 The file CHANGED between two consecutive reads: it is being written to right now"
+
+        local ioc_action
+        if [[ "$is_masked" == "yes" ]]; then
+            ioc_action="LEAVE THE MASK IN PLACE. Verify what it masks: 'systemctl status ${path##*/}' and look for the real unit file in /lib/systemd/system and /usr/lib/systemd/system - that file, not this symlink, is what must be preserved and quarantined. Removing this symlink re-enables the unit."
+        else
+            ioc_action="ISOLATE THIS HOST. Preserve the file and its metadata before anything else. Rotate every credential used on this host. Then find how it got here and what re-installs it - the payload is the symptom, the persistence is the problem. If root compromise is confirmed, rebuild from trusted media."
+        fi
 
         add_finding "$severity" "$title" \
             id="ioc-known-path:$path" \
@@ -305,7 +334,7 @@ The file CHANGED between two consecutive reads: it is being written to right now
             evidence="sha256=$sha hash_matches_known_ioc=$is_known symlink=$is_link${link_target:+ -> $link_target} changed_while_reading=$changed
 owner=$(stat -Lc '%U:%G' "$path" 2>/dev/null) mode=$(stat -Lc '%a' "$path" 2>/dev/null) size=$(stat -Lc '%s' "$path" 2>/dev/null) mtime=$(file_mtime_human "$path")
 package=$(pkg_owner "$path")" \
-            action="ISOLATE THIS HOST. Preserve the file and its metadata before anything else. Rotate every credential used on this host. Then find how it got here and what re-installs it - the payload is the symptom, the persistence is the problem. If root compromise is confirmed, rebuild from trusted media."
+            action="$ioc_action"
 
         evidence_snapshot "$path" \
             "$(printf '%s|ioc-known|%s' "$ITM_HOSTNAME" "$path" | sha256sum | cut -c1-32)" \

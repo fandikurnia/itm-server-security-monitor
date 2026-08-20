@@ -53,6 +53,16 @@ REMEDIATE_BASE_DIR="${REMEDIATE_BASE_DIR:-/root/forensic}"
 # Helpers
 # ------------------------------------------------------------
 
+# Exit code used by a response script that deliberately stopped
+# before changing anything, because a precondition was not met.
+#
+# It must NOT be 0. Triage reads the exit status to decide what to
+# write into DECISIONS.log, and a script that preserved evidence
+# but changed nothing was once recorded as "CONTAINED" - the log
+# then claimed a threat had been handled while the malicious line
+# was still live in the file.
+REM_EXIT_MANUAL=10
+
 # The quarantine filename, computed the same way the generated
 # script computes it, so rollback instructions can be printed as
 # literal copy-pasteable paths instead of unexpanded variables.
@@ -397,8 +407,10 @@ systemctl daemon-reload && systemctl enable --now '$(basename "$path")'"
                 printf 'printf "############################################################\\n\\n"\n'
                 printf 'if [[ "${CONSOLE_ACCESS:-no}" != "yes" ]]; then\n'
                 printf '    log "set CONSOLE_ACCESS=yes as well, once you have a recovery path"\n'
-                printf '    log "evidence has been preserved; nothing was changed"\n'
-                printf '    exit 0\n'
+                printf '    log "evidence has been preserved; NOTHING WAS CHANGED"\n'
+                printf '    log "to apply the PAM edit:"\n'
+                printf '    log "  sudo CONFIRM=yes CONSOLE_ACCESS=yes bash $0"\n'
+                printf '    exit %s\n' "$REM_EXIT_MANUAL"
                 printf 'fi\n\n'
             } >> "$file"
             rem_confirm_gate "$file" \
@@ -739,7 +751,7 @@ rem_generate() {
         printf '    exit 1\n'
         printf 'fi\n\n'
         printf 'TOTAL=$(wc -l < "$INCIDENT_DIR/findings.tsv" 2>/dev/null || echo 0)\n'
-        printf 'CONTAINED=0; ACCEPTED=0; SKIPPED=0; N=0\n\n'
+        printf 'CONTAINED=0; ACCEPTED=0; SKIPPED=0; MANUAL=0; N=0\n\n'
         printf 'printf "\\n============================================================\\n"\n'
         printf 'printf " INCIDENT TRIAGE - %%s finding(s)\\n" "$TOTAL"\n'
         printf 'printf "============================================================\\n"\n'
@@ -797,7 +809,22 @@ rem_generate() {
         printf '            printf "  reason for containing (one line, optional): "\n'
         printf '            read -r REASON </dev/tty || REASON=""\n'
         printf '            printf "\\n"\n'
-        printf '            if CONFIRM=yes FORCE=yes bash "$INCIDENT_DIR/$SCRIPT"; then\n'
+        printf '            CONFIRM=yes FORCE=yes bash "$INCIDENT_DIR/$SCRIPT"; RC=$?\n'
+        printf '            if (( RC == %s )); then\n' "$REM_EXIT_MANUAL"
+        printf '                printf "  -> NOT contained. The script stopped on purpose and changed nothing.\\n"\n'
+        printf '                printf "     Read the reason above, then run it yourself:\\n"\n'
+        printf '                printf "       sudo CONFIRM=yes CONSOLE_ACCESS=yes bash %%s/%%s\\n" "$INCIDENT_DIR" "$SCRIPT"\n'
+        printf '                MANUAL=$(( MANUAL + 1 ))\n'
+        printf '                {\n'
+        printf '                  printf "%%s | MANUAL    | %%s | %%s\\n" "$(date "+%%F %%T")" "$SEV" "$TITLE"\n'
+        printf '                  printf "    path      : %%s\\n" "${FPATH:-n/a}"\n'
+        printf '                  printf "    operator  : %%s from %%s\\n" "$OPERATOR" "$FROM"\n'
+        printf '                  printf "    reason    : %%s\\n" "${REASON:-(none given)}"\n'
+        printf '                  printf "    outcome   : judged NOT legitimate, but nothing was changed yet\\n"\n'
+        printf '                  printf "    next step : sudo CONFIRM=yes CONSOLE_ACCESS=yes bash %%s\\n" "$SCRIPT"\n'
+        printf '                  printf "    ref       : %%s\\n\\n" "$REF"\n'
+        printf '                } >> "$DECISIONS"\n'
+        printf '            elif (( RC == 0 )); then\n'
         printf '                CONTAINED=$(( CONTAINED + 1 ))\n'
         printf '                QPATH="$(ls -1t "$INCIDENT_DIR/quarantine" 2>/dev/null | head -1)"\n'
         printf '                {\n'
