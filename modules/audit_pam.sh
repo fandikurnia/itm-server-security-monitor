@@ -26,6 +26,31 @@ PAM_DIR="${PAM_DIR:-/etc/pam.d}"
 
 PAM_EXFIL_PATTERN='curl|wget|nc[[:space:]]|ncat|socat|/dev/tcp/|telnet|openssl[[:space:]]+s_client|base64|xxd|sendmail|mail[[:space:]]+-s|python[0-9]?|perl|ruby|php|ftp|scp|rsync'
 
+# A PAM file may be generated from a template rather than edited
+# by hand. On RHEL-family hosts authselect rewrites /etc/pam.d
+# from a profile, and it says so in the first lines of the file.
+#
+# This changes the remediation completely: editing the generated
+# file is undone the next time the profile is applied, and the
+# injected line will come back if the attacker also touched the
+# profile template.
+pam_is_generated() {
+    local file="$1"
+    [[ -r "$file" ]] || return 1
+    head -5 "$file" 2>/dev/null | grep -qiE 'auto-generated|authselect|User changes will be destroyed'
+}
+
+pam_generated_note() {
+    local file="$1"
+    pam_is_generated "$file" || return 0
+    printf '
+This file is GENERATED (authselect or similar): editing it directly is reverted the
+next time the profile is applied. Check the profile templates as well:
+  authselect current
+  grep -rn "pam_exec" /etc/authselect/ 2>/dev/null
+If the injected line is in the template, it reappears in every generated file.'
+}
+
 pam_exec_is_allowed() {
     local target="$1" allowed
     for allowed in $PAM_EXEC_ALLOW; do
@@ -151,7 +176,7 @@ check_pam_exec() {
                     path="$file" \
                     process="pam stack: $type_field -> ${target:-<no path argument>}" \
                     evidence="Line: $(truncate_text "$line" 200)
-Helper: $(pam_inspect_helper "$target")
+Helper: $(pam_inspect_helper "$target")$(pam_generated_note "$file")
 expose_authtok makes PAM write the cleartext authentication token to this program's stdin." \
                     action="ISOLATE THE HOST AND PRESERVE EVIDENCE. Do not edit PAM over SSH without an open console session. Rotate every credential that authenticated on this host since the helper's mtime. Treat host integrity as UNTRUSTED."
                 continue
@@ -278,7 +303,7 @@ Re-enabling the hook requires deleting one '#'"
 The hook used expose_authtok: it received cleartext authentication tokens"
 
                 evidence="Line: $(truncate_text "$stripped" 200)
-Payload: $(pam_inspect_helper "$target")
+Payload: $(pam_inspect_helper "$target")$(pam_generated_note "$file")
 The entry is inert right now. The capability is not: the payload is on disk and the configuration to invoke it was there long enough to be commented out rather than removed."
 
                 action="TREAT AS AN ACTIVE COMPROMISE. Do not delete the payload before capturing it: copy it and its metadata to /root/forensic and record the SHA256. Rotate every credential that authenticated on this host since the payload's mtime. Search for the persistence that re-installs it (cron, systemd, other PAM files, package hooks). Set HOST_TRUST_STATUS=\"UNTRUSTED\" in ${ITM_AUDIT_CONF}. This host needs a rebuild, not a cleanup."
@@ -294,7 +319,7 @@ This is residue of a previous compromise or of an incident response"
 The hook used expose_authtok: credentials were exposed to it while it was active"
 
                 evidence="Line: $(truncate_text "$stripped" 200)
-Payload ${target} is absent from disk."
+Payload ${target} is absent from disk.$(pam_generated_note "$file")"
 
                 action="Confirm this is the remnant of a cleanup you performed. If it is not, the host was compromised and the payload has been removed by someone else. Either way the credentials that authenticated while the hook was live must be considered exposed, and the host trust status must reflect the incident."
 

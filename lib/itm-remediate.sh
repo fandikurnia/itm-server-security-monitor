@@ -53,6 +53,23 @@ REMEDIATE_BASE_DIR="${REMEDIATE_BASE_DIR:-/root/forensic}"
 # Helpers
 # ------------------------------------------------------------
 
+# Exit code used by a response script that deliberately stopped
+# before changing anything, because a precondition was not met.
+#
+# It must NOT be 0. Triage reads the exit status to decide what to
+# write into DECISIONS.log, and a script that preserved evidence
+# but changed nothing was once recorded as "CONTAINED" - the log
+# then claimed a threat had been handled while the malicious line
+# was still live in the file.
+REM_EXIT_MANUAL=10
+
+# The quarantine filename, computed the same way the generated
+# script computes it, so rollback instructions can be printed as
+# literal copy-pasteable paths instead of unexpanded variables.
+rem_safe_name() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+}
+
 rem_slug() {
     # module + file basename, not the whole path: incident
     # directories are read by a human under pressure.
@@ -285,7 +302,7 @@ If the application imports this file, that feature breaks until it is restored."
                 printf 'log "review the list above: an upload rarely arrives alone"\n'
             } >> "$file"
             rem_footer "$file" \
-"mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\"
+"mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path'
 Then re-run: itm-security audit webshell gambling seo"
             ;;
 
@@ -305,7 +322,7 @@ uploads keep working but any PHP behaviour configured here stops."
                 printf 'log "every file listed above must be reviewed before it is trusted"\n'
             } >> "$file"
             rem_footer "$file" \
-"mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\"
+"mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path'
 Longer term: set AllowOverride None for this directory in the Apache config."
             ;;
 
@@ -336,7 +353,7 @@ appear in logs. Read the usage report printed above FIRST: if a unit calls it, d
 that unit before moving the binary, or the service will crash-loop."
             rem_quarantine_move "$file"
             rem_footer "$file" \
-"mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\" && chmod 755 \"$path\"
+"mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path' && chmod 755 '$path'
 The persistence that installed it is the real problem: review the usage report."
             ;;
 
@@ -371,8 +388,8 @@ Check the unit file in the evidence directory before continuing."
             } >> "$file"
             rem_footer "$file" \
 "systemctl unmask \"\$UNIT\"
-mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\"
-systemctl daemon-reload && systemctl enable --now \"\$UNIT\""
+mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path'
+systemctl daemon-reload && systemctl enable --now '$(basename "$path")'"
             ;;
 
         # ---- PAM credential stealer -----------------------------
@@ -390,8 +407,10 @@ systemctl daemon-reload && systemctl enable --now \"\$UNIT\""
                 printf 'printf "############################################################\\n\\n"\n'
                 printf 'if [[ "${CONSOLE_ACCESS:-no}" != "yes" ]]; then\n'
                 printf '    log "set CONSOLE_ACCESS=yes as well, once you have a recovery path"\n'
-                printf '    log "evidence has been preserved; nothing was changed"\n'
-                printf '    exit 0\n'
+                printf '    log "evidence has been preserved; NOTHING WAS CHANGED"\n'
+                printf '    log "to apply the PAM edit:"\n'
+                printf '    log "  sudo CONFIRM=yes CONSOLE_ACCESS=yes bash $0"\n'
+                printf '    exit %s\n' "$REM_EXIT_MANUAL"
                 printf 'fi\n\n'
             } >> "$file"
             rem_confirm_gate "$file" \
@@ -400,17 +419,31 @@ to quarantine. A mistake here locks out every login on this host.
 The full PAM directory has already been backed up to the evidence folder."
             {
                 printf 'PAMFILE=%s\n' "$(rem_q "$path")"
-                printf 'log "commenting pam_exec lines in $PAMFILE"\n'
-                printf 'cp -a -- "$PAMFILE" "$EVIDENCE/$(basename -- "$PAMFILE").before"\n'
-                printf 'sed -i "s|^\\([^#].*pam_exec\\.so.*\\)$|# ITM-DISABLED \\1|" -- "$PAMFILE"\n'
+                printf 'cp -a -- "$PAMFILE" "$EVIDENCE/$(basename -- "$PAMFILE").before"\n\n'
+                printf '# Two different states need two different edits.\n'
+                printf '#\n'
+                printf '# ACTIVE hook   : comment it out. Deleting a live line\n'
+                printf '#                 changes the stack length; commenting\n'
+                printf '#                 is the smallest reversible change.\n'
+                printf '# DORMANT hook  : the line is already inert residue of a\n'
+                printf '#                 past compromise. It is REMOVED, and the\n'
+                printf '#                 original file is in the evidence folder\n'
+                printf '#                 so the residue is not lost as a record.\n'
+                printf 'if grep -qE "^[^#]*pam_exec\\.so" -- "$PAMFILE"; then\n'
+                printf '    log "commenting ACTIVE pam_exec lines in $PAMFILE"\n'
+                printf '    sed -i "s|^\\([^#].*pam_exec\\.so.*\\)$|# ITM-DISABLED \\1|" -- "$PAMFILE"\n'
+                printf 'else\n'
+                printf '    log "removing DORMANT (commented) pam_exec lines from $PAMFILE"\n'
+                printf '    sed -i "/^[[:space:]]*#.*pam_exec\\.so/d" -- "$PAMFILE"\n'
+                printf 'fi\n'
                 printf 'log "diff:"\n'
                 printf 'diff -u "$EVIDENCE/$(basename -- "$PAMFILE").before" "$PAMFILE" || true\n'
                 printf 'CHANGED=1\n'
                 printf 'log "TEST AUTHENTICATION NOW, from a second session, before closing this one"\n'
             } >> "$file"
             rem_footer "$file" \
-"cp -a \"\$EVIDENCE/\$(basename \"$path\").before\" \"$path\"
-Full restore: tar -xzf \"\$EVIDENCE/pam.d-backup.tar.gz\" -C /etc
+"cp -a '$REM_INCIDENT_DIR/evidence/$(basename "$path").before' '$path'
+Full restore: tar -xzf '$REM_INCIDENT_DIR/evidence/pam.d-backup.tar.gz' -C /etc
 Rotate every credential used on this host: the stealer saw them in cleartext."
             ;;
 
@@ -430,7 +463,7 @@ depended on it changes behaviour."
                 printf 'log "output of $CMD can be trusted again once this points at /usr/bin or /bin"\n'
             } >> "$file"
             rem_footer "$file" \
-"mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\" && chmod 755 \"$path\""
+"mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path' && chmod 755 '$path'"
             ;;
 
         # ---- world-writable data directory ----------------------
@@ -718,7 +751,7 @@ rem_generate() {
         printf '    exit 1\n'
         printf 'fi\n\n'
         printf 'TOTAL=$(wc -l < "$INCIDENT_DIR/findings.tsv" 2>/dev/null || echo 0)\n'
-        printf 'CONTAINED=0; ACCEPTED=0; SKIPPED=0; N=0\n\n'
+        printf 'CONTAINED=0; ACCEPTED=0; SKIPPED=0; MANUAL=0; N=0\n\n'
         printf 'printf "\\n============================================================\\n"\n'
         printf 'printf " INCIDENT TRIAGE - %%s finding(s)\\n" "$TOTAL"\n'
         printf 'printf "============================================================\\n"\n'
@@ -776,7 +809,22 @@ rem_generate() {
         printf '            printf "  reason for containing (one line, optional): "\n'
         printf '            read -r REASON </dev/tty || REASON=""\n'
         printf '            printf "\\n"\n'
-        printf '            if CONFIRM=yes FORCE=yes bash "$INCIDENT_DIR/$SCRIPT"; then\n'
+        printf '            CONFIRM=yes FORCE=yes bash "$INCIDENT_DIR/$SCRIPT"; RC=$?\n'
+        printf '            if (( RC == %s )); then\n' "$REM_EXIT_MANUAL"
+        printf '                printf "  -> NOT contained. The script stopped on purpose and changed nothing.\\n"\n'
+        printf '                printf "     Read the reason above, then run it yourself:\\n"\n'
+        printf '                printf "       sudo CONFIRM=yes CONSOLE_ACCESS=yes bash %%s/%%s\\n" "$INCIDENT_DIR" "$SCRIPT"\n'
+        printf '                MANUAL=$(( MANUAL + 1 ))\n'
+        printf '                {\n'
+        printf '                  printf "%%s | MANUAL    | %%s | %%s\\n" "$(date "+%%F %%T")" "$SEV" "$TITLE"\n'
+        printf '                  printf "    path      : %%s\\n" "${FPATH:-n/a}"\n'
+        printf '                  printf "    operator  : %%s from %%s\\n" "$OPERATOR" "$FROM"\n'
+        printf '                  printf "    reason    : %%s\\n" "${REASON:-(none given)}"\n'
+        printf '                  printf "    outcome   : judged NOT legitimate, but nothing was changed yet\\n"\n'
+        printf '                  printf "    next step : sudo CONFIRM=yes CONSOLE_ACCESS=yes bash %%s\\n" "$SCRIPT"\n'
+        printf '                  printf "    ref       : %%s\\n\\n" "$REF"\n'
+        printf '                } >> "$DECISIONS"\n'
+        printf '            elif (( RC == 0 )); then\n'
         printf '                CONTAINED=$(( CONTAINED + 1 ))\n'
         printf '                QPATH="$(ls -1t "$INCIDENT_DIR/quarantine" 2>/dev/null | head -1)"\n'
         printf '                {\n'
