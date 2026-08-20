@@ -768,9 +768,15 @@ test_installer() {
     want "installer" || return 0
     printf '\nTEST: installer well-formedness\n'
 
+    # The pattern is anchored with optional leading whitespace on
+    # purpose. It used to require column 0, so an INDENTED install
+    # block was never examined - and that is exactly where a stray
+    # line got spliced in, leaving a call with a source and no
+    # destination. Rocky hosts failed the install with "missing
+    # destination file operand" while this test reported success.
     local bad
     bad="$(awk '
-      /^install \\$/ { inblk=1; blk=""; line=NR }
+      /^[[:space:]]*install \\$/ { inblk=1; blk=""; line=NR }
       inblk {
         blk = blk " " $0
         if ($0 !~ /\\$/) {
@@ -799,8 +805,15 @@ test_installer() {
     check "every registered module is in the installer manifest" "$?" "$missing"
 
     # --- config migration must be additive only ----------------
+    #
+    # setup_case is what defines CASE_DIR. Without it this test
+    # only ran when some earlier test happened to leave the
+    # variable set, so "tests/run.sh installer" on its own died
+    # with "CASE_DIR: unbound variable" and every assertion below
+    # was skipped.
+    setup_case installer
+
     local conf="$CASE_DIR/audit.conf"
-    mkdir -p "$CASE_DIR"
     cat > "$conf" <<'EOC'
 HOST_TRUST_STATUS="UNTRUSTED"
 WEB_ROOTS="/var/www/html/portal"
@@ -878,7 +891,11 @@ EOS
     (( VERBOSE )) && printf '%s\n' "$out"
 
     # --- 30 minute session: INFO, no finding
-    ! printf '%s' "$out" | grep -qE '^\[(MEDIUM|HIGH|CRITICAL)\].*c1'
+    # Match the session id as the module prints it (session=cN).
+    # A bare "cN" is two characters and the output carries sha256
+    # fingerprints, so any hash containing that pair made the
+    # assertion fail at random.
+    ! printf '%s' "$out" | grep -qE '^\[(MEDIUM|HIGH|CRITICAL)\].*session=c1( |$)'
     check "session 30 minutes = INFO (no finding raised)" "$?"
 
     # --- 2.5 hour session: WARNING
@@ -898,7 +915,7 @@ EOS
     check "privilege escalation (sudo su) is recorded on the session" "$?"
 
     # --- local console is never even considered
-    ! printf '%s' "$out" | grep -q 'c5'
+    ! printf '%s' "$out" | grep -qE 'session=c5( |$)'
     check "local console session is ignored entirely" "$?"
 
     # --- monitor_only must not terminate anything

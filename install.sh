@@ -572,8 +572,7 @@ else
         -o root \
         -g root \
         -m 0600 \
-        "$SCRIPT_DIR/config/audit.conf.example"
-    "$SCRIPT_DIR/config/known-c2.list.example" \
+        "$SCRIPT_DIR/config/audit.conf.example" \
         "$AUDIT_CONF"
 
     echo "[+] audit.conf created from example."
