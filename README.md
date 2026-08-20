@@ -269,6 +269,59 @@ pointless disk-wide scan:
 Override with `WEB_WORKLOAD_OVERRIDE="yes"|"no"|"auto"` in `audit.conf` when
 detection cannot see your setup.
 
+### Interactive triage
+
+Generating a response pack is not the same as deciding what to do with it. The
+triage runner walks the findings one at a time and asks a single question per
+finding:
+
+```bash
+sudo itm-security triage             # audit, generate the pack, then walk it
+sudo bash /root/forensic/incident-*/00-triage.sh    # walk an existing pack
+```
+
+```text
+[1/2] CRITICAL (confidence 99%)
+Suspected webshell or unauthorised PHP file
+path    : /var/www/html/portal/shell.phtml
+why     :
+          - eval/assert of a decoded payload (classic packed webshell) (+45)
+          - shell command executed with request input (+50)
+          - created or modified in the last 0h (+20)
+on disk : mode=664 owner=www-data:www-data size=216 mtime=2026-08-20 14:41:01
+
+Is this legitimate?  y=no,contain  n=yes,leave  v=view  s=skip  q=quit [n]:
+```
+
+`y` means *not legitimate* → the file is moved to quarantine. `n` means
+*legitimate* → it is left exactly where it is. The default is `n`, because the
+safe answer should be the one you get by pressing Enter.
+
+Both answers ask for a reason, and both are written to `DECISIONS.log` in the
+incident directory:
+
+```text
+2026-08-20 14:41:11 | CONTAINED | CRITICAL | Suspected webshell or unauthorised PHP file
+    path      : /var/www/html/portal/shell.phtml
+    operator  : fandi from 192.168.112.10
+    reason    : webshell tidak dikenal tim aplikasi
+    quarantine: _var_www_html_portal_shell.phtml
+    rollback  : see PHASE 4 in 10-01-webshell-shell.phtml-f6c1db31.sh
+
+2026-08-20 14:41:11 | ACCEPTED  | CRITICAL | SEO poisoning indicators in web content
+    path      : /var/www/html/portal/vendor.js
+    operator  : fandi from 192.168.112.10
+    reason    : file bawaan tema, diverifikasi vendor
+```
+
+This is the part that makes an incident reviewable later: *why is this file in
+quarantine* and *why did we leave that one alone* both have written answers, with
+who decided and when. Accepting a finding also offers to add it to
+`web-exclusions.conf`, so the same file stops being reported on every future
+scan.
+
+A summary is sent to Telegram when the session ends.
+
 ### Evidence handling
 
 For every HIGH/CRITICAL file finding the audit copies the file to

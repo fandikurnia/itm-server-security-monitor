@@ -1,0 +1,38 @@
+# ============================================================
+# ITM Server Security Monitor
+# Command-and-control watchlist
+#
+# Installed to /etc/security-monitor/known-c2.list
+#
+# Deliberately a separate, dead simple file: one indicator per
+# line, no syntax, no types. Adding an address during an
+# incident must not require editing source code or knowing the
+# IOC database format.
+#
+#   1.2.3.4              IPv4
+#   2001:db8::1          IPv6
+#   evil.example         domain (also matches subdomains)
+#
+# Checked against:
+#   - established sockets  (ss, resolved from a trusted path)
+#   - the resolver configuration and /etc/hosts
+#   - DNS resolution of the listed domains, so a host that can
+#     still reach the C2 is reported even with no live session
+#
+# Entries are labelled by technique, not by the host they came
+# from: this file is deployed fleet-wide, and which server a
+# match occurred on is recorded in the finding itself.
+#
+# Lines starting with # are ignored. The installer merges new
+# entries on upgrade and never removes yours.
+# ============================================================
+
+# --- INCIDENT: PAM credential harvester (2026-08) ---
+# Collector that received the captured credentials.
+104.248.150.145
+petupmanluy.xyz
+
+# Attacker-controlled edge hosts used to serve the poisoned
+# content in the same incident.
+jdih-kemenpora.edgeone.app
+jdih-kemenpora-plw72286ru.edgeone.app

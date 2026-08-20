@@ -455,6 +455,88 @@ test_remediation() {
 }
 
 # ============================================================
+# TEST: JDIH Kemenpora incident - data directory + C2 watchlist
+# ============================================================
+
+test_datadir() {
+
+    want "datadir" || return 0
+    printf '\nTEST: data directory exposure\n'
+
+    setup_case datadir
+    mkdir -p "$CASE_DIR"/{opt/mysql-jdih,opt/normal,opt/sticky,www}
+
+    head -c 64 /dev/urandom > "$CASE_DIR/opt/mysql-jdih/ibdata1"
+    : > "$CASE_DIR/opt/mysql-jdih/ib_logfile0"
+    chmod 777  "$CASE_DIR/opt/mysql-jdih"
+    chmod 755  "$CASE_DIR/opt/normal"
+    chmod 1777 "$CASE_DIR/opt/sticky"
+    chmod 777  "$CASE_DIR/www"
+
+    local out
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        DATADIR_SCAN_PATHS="$CASE_DIR/opt $CASE_DIR/www" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit datadir --dry-run 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -qE '^\[CRITICAL.*database files'
+    check "777 directory holding ibdata1 = CRITICAL" "$?"
+
+    printf '%s' "$out" | grep -q 'mysql-jdih'
+    check "the offending directory is named in the finding" "$?"
+
+    ! printf '%s' "$out" | grep -q 'opt/normal'
+    check "a 755 directory raises nothing" "$?"
+
+    ! printf '%s' "$out" | grep -q 'opt/sticky'
+    check "a sticky world-writable directory (like /tmp) raises nothing" "$?"
+
+    printf '%s' "$out" | grep -qE '^\[(HIGH|MEDIUM).*World-writable data directory'
+    check "world-writable without database files is HIGH/MEDIUM, not CRITICAL" "$?"
+
+    # read-only guarantee
+    [[ "$(stat -c '%a' "$CASE_DIR/opt/mysql-jdih")" == "777" ]]
+    check "the audit did NOT change permissions" "$?"
+}
+
+test_c2_watchlist() {
+
+    want "c2" || return 0
+    printf '\nTEST: C2 watchlist and DNS check\n'
+
+    setup_case c2
+    printf '104.248.150.145\nevil-c2.invalid\n' > "$CASE_DIR/conf/known-c2.list"
+    printf 'ip:203.0.113.5\n' > "$CASE_DIR/conf/ioc/known-iocs.conf"
+
+    # a pinned C2 entry in a fake hosts file
+    printf '127.0.0.1 localhost\n192.0.2.10 evil-c2.invalid\n' > "$CASE_DIR/hosts"
+
+    local out
+    out="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        IOC_SYSTEM_BIN_DIRS="$CASE_DIR" IOC_SEARCH_CONFIG_DIRS="$CASE_DIR" \
+        IOC_FILENAME_SEARCH_DIRS="$CASE_DIR" \
+        timeout 150 "$REPO_DIR/bin/itm-security" audit ioc --dry-run 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -q 'C2 watchlist loaded (2 entries'
+    check "standalone C2 watchlist is loaded" "$?"
+
+    printf '%s' "$out" | grep -qi 'no active connection to any known C2'
+    check "watchlist IPs are checked against live sockets" "$?"
+
+    ! printf '%s' "$out" | grep -qE '^\[CRITICAL.*C2'
+    check "a watchlist with no live match raises no CRITICAL" "$?"
+}
+
+# ============================================================
 # TEST: network exposure - new listeners, external peers,
 #       unattributable processes, and the noise controls
 # ============================================================
@@ -993,6 +1075,80 @@ test_self_protection() {
 # Case 17: a monitor that stops silently must say so itself.
 # ============================================================
 
+test_triage() {
+
+    want "triage" || return 0
+    printf '\nTEST: interactive triage\n'
+
+    command -v script >/dev/null 2>&1 || {
+        printf '  SKIP  (util-linux "script" not available)\n'
+        return 0
+    }
+
+    setup_case triage
+    mkdir -p "$CASE_DIR/www"
+    cp "$FIXTURES/webshell/heph.phtml.txt" "$CASE_DIR/www/shell.phtml"
+    cp "$FIXTURES/seo-cloak/vendor.js.txt" "$CASE_DIR/www/vendor.js"
+
+    local env_common=(
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log"
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf"
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev"
+        REMEDIATE_BASE_DIR="$CASE_DIR/forensic" WEB_WORKLOAD_OVERRIDE=yes
+        WEB_ROOTS="$CASE_DIR/www"
+    )
+
+    env "${env_common[@]}" timeout 200 "$REPO_DIR/bin/itm-security" \
+        remediate webshell seo --quiet >/dev/null 2>&1
+
+    local inc
+    inc="$(find "$CASE_DIR/forensic" -maxdepth 1 -type d -name 'incident-*' | head -1)"
+
+    [[ -x "$inc/00-triage.sh" ]]
+    check "an interactive triage script is generated with the pack" "$?"
+
+    bash -n "$inc/00-triage.sh" 2>/dev/null
+    check "the triage script parses" "$?"
+
+    [[ -s "$inc/findings.tsv" ]]
+    check "a machine readable finding index accompanies it" "$?"
+
+    # first finding: NOT legitimate -> contain
+    # second finding: legitimate    -> leave, then decline the exclusion
+    printf 'y\nunknown webshell\nn\nshipped with the theme\nn\n' \
+        | script -qec "bash $inc/00-triage.sh" /dev/null >/dev/null 2>&1
+
+    [[ ! -f "$CASE_DIR/www/shell.phtml" ]]
+    check "answering y contains the finding (removed from the web root)" "$?"
+
+    find "$inc/quarantine" -type f 2>/dev/null | grep -q .
+    check "the contained file is in quarantine, not deleted" "$?"
+
+    [[ -f "$CASE_DIR/www/vendor.js" ]]
+    check "answering n leaves the file exactly where it was" "$?"
+
+    [[ -s "$inc/DECISIONS.log" ]]
+    check "every decision is written to DECISIONS.log" "$?"
+
+    grep -q 'CONTAINED' "$inc/DECISIONS.log"
+    check "the log records what was contained" "$?"
+
+    grep -q 'ACCEPTED' "$inc/DECISIONS.log"
+    check "the log records what was accepted as legitimate" "$?"
+
+    grep -q 'unknown webshell' "$inc/DECISIONS.log"
+    check "the operator's reason is stored verbatim" "$?"
+
+    grep -q 'shipped with the theme' "$inc/DECISIONS.log"
+    check "the reason for accepting is stored too" "$?"
+
+    grep -qE 'operator  :' "$inc/DECISIONS.log"
+    check "who decided, and from where, is recorded" "$?"
+
+    grep -q 'rollback' "$inc/DECISIONS.log"
+    check "the log points at the rollback for anything contained" "$?"
+}
+
 test_health() {
 
     want "health" || return 0
@@ -1115,9 +1271,12 @@ test_false_positives
 test_non_web_host
 test_safety_invariants
 test_remediation
+test_triage
 test_health
 test_cron
 test_self_protection
+test_datadir
+test_c2_watchlist
 test_network_exposure
 test_ioc_kemenpora
 test_ioc_pam_and_dedup

@@ -433,6 +433,45 @@ depended on it changes behaviour."
 "mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\" && chmod 755 \"$path\""
             ;;
 
+        # ---- world-writable data directory ----------------------
+        datadir-world-writable:*)
+            rem_preserve_file "$file" "$path" "$hash"
+            {
+                printf 'log "recording current state before anything is proposed"\n'
+                printf '{\n'
+                printf '    stat -c "mode=%%a owner=%%U:%%G %%n" -- "$TARGET"\n'
+                printf '    printf "\\n=== contents ===\\n"\n'
+                printf '    ls -la -- "$TARGET" 2>/dev/null | head -40\n'
+                printf '    printf "\\n=== processes holding files open ===\\n"\n'
+                printf '    lsof +D "$TARGET" 2>/dev/null | head -20 || fuser -v -m "$TARGET" 2>&1 | head -20\n'
+                printf '} > "$EVIDENCE/$SAFE_NAME.state.txt" 2>/dev/null\n'
+                printf 'cat "$EVIDENCE/$SAFE_NAME.state.txt"\n\n'
+            } >> "$file"
+            rem_confirm_gate "$file" \
+"NOTHING is changed automatically. Tightening permissions on a live datastore
+directory stops the database writing to it if the owning account is guessed wrong,
+and a database that cannot write its redo log stops serving immediately.
+This step prints the exact commands for you to apply after checking the owner above."
+            {
+                printf 'OWNER="$(stat -c %%U -- "$TARGET" 2>/dev/null)"\n'
+                printf 'cat <<PLAN | tee "$INCIDENT_DIR/plan-$SAFE_NAME.txt"\n'
+                printf 'Confirm the owning account from the lsof/fuser output above, then:\n'
+                printf '\n'
+                printf '  systemctl stop <the service that uses this directory>\n'
+                printf '  chown -R <account>:<account> %%s\n' "$path"
+                printf '  chmod 700 %%s\n' "$path"
+                printf '  systemctl start <the service>\n'
+                printf '\n'
+                printf 'Verify afterwards that the service still writes: check its log and\n'
+                printf 'that the datastore files keep their mtime moving.\n'
+                printf '\n'
+                printf 'While the directory was world-writable, treat the data as exposed:\n'
+                printf 'any local account could read the raw files without a database password.\n'
+                printf 'PLAN\n'
+            } >> "$file"
+            rem_footer "$file" "Nothing was changed, so there is nothing to roll back."
+            ;;
+
         # ---- writable directory that executes PHP ---------------
         writable-php-dir:*)
             rem_preserve_file "$file" "$path" "$hash"
@@ -617,6 +656,15 @@ rem_generate() {
             "${REM_ID[$i]}" "${REM_PATH[$i]}" "${REM_HASH[$i]}" \
             "${REM_TITLE[$i]}" "${REM_ACTION[$i]}"
 
+        # Machine readable index for the triage runner.
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${file##*/}" "${REM_SEV[$i]}" "${REM_CONF[$i]}" \
+            "${REM_TITLE[$i]}" "${REM_PATH[$i]}" "${REM_FP[$i]}" \
+            >> "$REM_INCIDENT_DIR/findings.tsv"
+
+        # Reasons, one per line, for the triage display.
+        printf '%s\n' "${REM_REASONS[$i]}" > "$REM_INCIDENT_DIR/.reasons-${REM_FP[$i]}"
+
         {
             printf '[%s] %s (confidence %s%%)\n' "${REM_SEV[$i]}" "${REM_TITLE[$i]}" "${REM_CONF[$i]}"
             [[ -n "${REM_PATH[$i]}" ]] && printf '    path   : %s\n' "${REM_PATH[$i]}"
@@ -632,6 +680,172 @@ rem_generate() {
     done
 
     chmod 600 "$summary" 2>/dev/null || true
+
+    # --- interactive triage runner ----------------------------
+    #
+    # Walking the findings one at a time and recording the
+    # decision is the part that makes an incident reviewable a
+    # month later. "Why is this file in quarantine?" and "why did
+    # we leave that one alone?" both have written answers here,
+    # with who decided and when.
+    local triage="$REM_INCIDENT_DIR/00-triage.sh"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf '#\n'
+        printf '# ITM incident triage - interactive.\n'
+        printf '#\n'
+        printf '# Goes through every finding in this pack and asks one\n'
+        printf '# question per finding. Nothing is contained without an\n'
+        printf '# explicit yes, and every decision is written to\n'
+        printf '# DECISIONS.log with the reason you give.\n'
+        printf '#\n'
+        printf 'set -uo pipefail\n\n'
+        printf 'INCIDENT_DIR=%s\n' "$(rem_q "$REM_INCIDENT_DIR")"
+        printf 'cd "$INCIDENT_DIR" || exit 1\n\n'
+        printf 'DECISIONS="$INCIDENT_DIR/DECISIONS.log"\n'
+        printf 'NOTIFY=%s\n' "$(rem_q "$ITM_NOTIFY_BIN")"
+        printf 'OPERATOR="${SUDO_USER:-$(id -un 2>/dev/null)}"\n'
+        printf 'FROM="${SSH_CONNECTION:-}"; FROM="${FROM%%%% *}"\n'
+        printf '[[ -n "$FROM" ]] || FROM="local session (not proof of console access)"\n\n'
+        printf 'C_RED=""; C_YEL=""; C_DIM=""; C_OFF=""\n'
+        printf 'if [[ -t 1 ]]; then C_RED=$(printf "\\033[1;31m"); C_YEL=$(printf "\\033[1;33m"); C_DIM=$(printf "\\033[2m"); C_OFF=$(printf "\\033[0m"); fi\n\n'
+        printf '# Answers are read from the controlling terminal, so that\n'
+        printf '# is what must exist - stdin may legitimately be something\n'
+        printf '# else (a log pipe, a here-document driving the outer run).\n'
+        printf 'if [[ ! -e /dev/tty ]] || ! : >/dev/tty 2>/dev/null; then\n'
+        printf '    printf "This script is interactive and needs a controlling terminal.\\n" >&2\n'
+        printf '    printf "Run it from a shell: sudo bash %%s/00-triage.sh\\n" "$INCIDENT_DIR" >&2\n'
+        printf '    exit 1\n'
+        printf 'fi\n\n'
+        printf 'TOTAL=$(wc -l < "$INCIDENT_DIR/findings.tsv" 2>/dev/null || echo 0)\n'
+        printf 'CONTAINED=0; ACCEPTED=0; SKIPPED=0; N=0\n\n'
+        printf 'printf "\\n============================================================\\n"\n'
+        printf 'printf " INCIDENT TRIAGE - %%s finding(s)\\n" "$TOTAL"\n'
+        printf 'printf "============================================================\\n"\n'
+        printf 'printf "\\nFor each finding you decide one thing:\\n"\n'
+        printf 'printf "  is it legitimate, or is it not?\\n\\n"\n'
+        printf 'printf "  y = NOT legitimate  -> contain it (file is MOVED to quarantine, never deleted)\\n"\n'
+        printf 'printf "  n = legitimate      -> leave it alone, decision recorded  [default]\\n"\n'
+        printf 'printf "  v = view the full response script first\\n"\n'
+        printf 'printf "  s = skip, decide later\\n"\n'
+        printf 'printf "  q = stop here\\n\\n"\n'
+        printf 'printf "Every answer is written to %%s\\n\\n" "$DECISIONS"\n\n'
+        printf '{\n'
+        printf '  printf "============================================================\\n"\n'
+        printf '  printf " TRIAGE SESSION %%s\\n" "$(date "+%%Y-%%m-%%d %%H:%%M:%%S %%Z")"\n'
+        printf '  printf " operator : %%s\\n" "$OPERATOR"\n'
+        printf '  printf " source   : %%s\\n" "$FROM"\n'
+        printf '  printf " host     : %%s\\n" "$(hostname -f 2>/dev/null || hostname)"\n'
+        printf '  printf "============================================================\\n\\n"\n'
+        printf '} >> "$DECISIONS"\n\n'
+        printf 'TAB="$(printf "\\t")"\n'
+        printf 'while IFS="$TAB" read -r SCRIPT SEV CONF TITLE FPATH REF; do\n\n'
+        printf '    [[ -n "$SCRIPT" ]] || continue\n'
+        printf '    N=$(( N + 1 ))\n\n'
+        printf '    COLOR="$C_YEL"; [[ "$SEV" == "CRITICAL" ]] && COLOR="$C_RED"\n\n'
+        printf '    printf "\\n------------------------------------------------------------\\n"\n'
+        printf '    printf "[%%s/%%s] %%s%%s%%s (confidence %%s%%%%)\\n" "$N" "$TOTAL" "$COLOR" "$SEV" "$C_OFF" "$CONF"\n'
+        printf '    printf "%%s\\n" "$TITLE"\n'
+        printf '    [[ -n "$FPATH" ]] && printf "path    : %%s\\n" "$FPATH"\n'
+        printf '    if [[ -f "$INCIDENT_DIR/.reasons-$REF" ]]; then\n'
+        printf '        printf "why     :\\n"\n'
+        printf '        sed "s/^/          - /" "$INCIDENT_DIR/.reasons-$REF" | head -8\n'
+        printf '    fi\n'
+        printf '    if [[ -n "$FPATH" && -e "$FPATH" ]]; then\n'
+        printf '        printf "on disk : %%s\\n" "$(stat -c "mode=%%a owner=%%U:%%G size=%%s mtime=%%y" -- "$FPATH" 2>/dev/null | cut -c1-90)"\n'
+        printf '    elif [[ -n "$FPATH" ]]; then\n'
+        printf '        printf "on disk : %%sno longer present%%s\\n" "$C_DIM" "$C_OFF"\n'
+        printf '    fi\n\n'
+        printf '    ANSWER=""\n'
+        printf '    while :; do\n'
+        printf '        printf "\\n%%sIs this legitimate?%%s  y=no,contain  n=yes,leave  v=view  s=skip  q=quit [n]: " "$C_DIM" "$C_OFF"\n'
+        printf '        read -r ANSWER </dev/tty || ANSWER="q"\n'
+        printf '        case "${ANSWER,,}" in\n'
+        printf '            v) printf "\\n"; ${PAGER:-less} "$INCIDENT_DIR/$SCRIPT" </dev/tty >/dev/tty 2>&1 || cat "$INCIDENT_DIR/$SCRIPT" ;;\n'
+        printf '            y|n|s|q|"") break ;;\n'
+        printf '            *) printf "  please answer y, n, v, s or q\\n" ;;\n'
+        printf '        esac\n'
+        printf '    done\n\n'
+        printf '    case "${ANSWER,,}" in\n\n'
+        printf '        q) printf "\\nStopped by operator.\\n"; break ;;\n\n'
+        printf '        s)\n'
+        printf '            SKIPPED=$(( SKIPPED + 1 ))\n'
+        printf '            printf "%%s | SKIPPED  | %%s | %%s | ref=%%s\\n" "$(date "+%%F %%T")" "$SEV" "$TITLE" "$REF" >> "$DECISIONS"\n'
+        printf '            printf "  -> skipped, no decision recorded\\n" ;;\n\n'
+        printf '        y)\n'
+        printf '            printf "  reason for containing (one line, optional): "\n'
+        printf '            read -r REASON </dev/tty || REASON=""\n'
+        printf '            printf "\\n"\n'
+        printf '            if CONFIRM=yes FORCE=yes bash "$INCIDENT_DIR/$SCRIPT"; then\n'
+        printf '                CONTAINED=$(( CONTAINED + 1 ))\n'
+        printf '                QPATH="$(ls -1t "$INCIDENT_DIR/quarantine" 2>/dev/null | head -1)"\n'
+        printf '                {\n'
+        printf '                  printf "%%s | CONTAINED | %%s | %%s\\n" "$(date "+%%F %%T")" "$SEV" "$TITLE"\n'
+        printf '                  printf "    path      : %%s\\n" "${FPATH:-n/a}"\n'
+        printf '                  printf "    operator  : %%s from %%s\\n" "$OPERATOR" "$FROM"\n'
+        printf '                  printf "    reason    : %%s\\n" "${REASON:-(none given)}"\n'
+        printf '                  printf "    script    : %%s\\n" "$SCRIPT"\n'
+        printf '                  printf "    quarantine: %%s\\n" "${QPATH:-see script output}"\n'
+        printf '                  printf "    rollback  : see PHASE 4 in %%s\\n" "$SCRIPT"\n'
+        printf '                  printf "    ref       : %%s\\n\\n" "$REF"\n'
+        printf '                } >> "$DECISIONS"\n'
+        printf '            else\n'
+        printf '                printf "  -> the response script did not complete; nothing recorded as contained\\n"\n'
+        printf '                printf "%%s | FAILED   | %%s | %%s | ref=%%s\\n" "$(date "+%%F %%T")" "$SEV" "$TITLE" "$REF" >> "$DECISIONS"\n'
+        printf '            fi ;;\n\n'
+        printf '        *)\n'
+        printf '            printf "  why is it legitimate? (this is what you will read in a month): "\n'
+        printf '            read -r REASON </dev/tty || REASON=""\n'
+        printf '            ACCEPTED=$(( ACCEPTED + 1 ))\n'
+        printf '            {\n'
+        printf '              printf "%%s | ACCEPTED  | %%s | %%s\\n" "$(date "+%%F %%T")" "$SEV" "$TITLE"\n'
+        printf '              printf "    path      : %%s\\n" "${FPATH:-n/a}"\n'
+        printf '              printf "    operator  : %%s from %%s\\n" "$OPERATOR" "$FROM"\n'
+        printf '              printf "    reason    : %%s\\n" "${REASON:-(none given)}"\n'
+        printf '              printf "    ref       : %%s\\n\\n" "$REF"\n'
+        printf '            } >> "$DECISIONS"\n'
+        printf '            printf "  -> left in place, decision recorded\\n"\n'
+        printf '            if [[ -n "$FPATH" && -f "$FPATH" ]]; then\n'
+        printf '                printf "  add it to the exclusion list so future scans stop reporting it? [y/N]: "\n'
+        printf '                read -r EXC </dev/tty || EXC="n"\n'
+        printf '                if [[ "${EXC,,}" == "y" ]]; then\n'
+        printf '                    EXCFILE="/etc/security-monitor/ioc/web-exclusions.conf"\n'
+        printf '                    if [[ -w "$(dirname "$EXCFILE")" ]]; then\n'
+        printf '                        printf "\\n# accepted by %%s on %%s: %%s\\n%%s\\n" \\\n'
+        printf '                            "$OPERATOR" "$(date "+%%F")" "${REASON:-no reason given}" "$FPATH" >> "$EXCFILE"\n'
+        printf '                        printf "  -> added to %%s\\n" "$EXCFILE"\n'
+        printf '                        printf "    excluded  : added to %%s\\n\\n" "$EXCFILE" >> "$DECISIONS"\n'
+        printf '                    else\n'
+        printf '                        printf "  -> cannot write %%s (run as root)\\n" "$EXCFILE"\n'
+        printf '                    fi\n'
+        printf '                fi\n'
+        printf '            fi ;;\n'
+        printf '    esac\n\n'
+        printf 'done < "$INCIDENT_DIR/findings.tsv"\n\n'
+        printf 'printf "\\n============================================================\\n"\n'
+        printf 'printf " TRIAGE COMPLETE\\n"\n'
+        printf 'printf "============================================================\\n"\n'
+        printf 'printf "  contained : %%s\\n" "$CONTAINED"\n'
+        printf 'printf "  accepted  : %%s\\n" "$ACCEPTED"\n'
+        printf 'printf "  skipped   : %%s\\n" "$SKIPPED"\n'
+        printf 'printf "\\n  decisions : %%s\\n" "$DECISIONS"\n'
+        printf 'printf "  evidence  : %%s/evidence\\n" "$INCIDENT_DIR"\n'
+        printf 'printf "  quarantine: %%s/quarantine\\n\\n" "$INCIDENT_DIR"\n'
+        printf '{ printf "  SESSION TOTAL: contained=%%s accepted=%%s skipped=%%s\\n\\n" "$CONTAINED" "$ACCEPTED" "$SKIPPED"; } >> "$DECISIONS"\n\n'
+        printf 'if [[ -x "$NOTIFY" ]] && (( CONTAINED > 0 || ACCEPTED > 0 )); then\n'
+        printf '    "$NOTIFY" "📋 INCIDENT TRIAGE COMPLETED\n'
+        printf '\n'
+        printf 'Operator : $OPERATOR\n'
+        printf 'Source   : $FROM\n'
+        printf 'Contained: $CONTAINED\n'
+        printf 'Accepted : $ACCEPTED (recorded as legitimate)\n'
+        printf 'Skipped  : $SKIPPED\n'
+        printf '\n'
+        printf 'Decisions: $DECISIONS" >/dev/null 2>&1 || true\n'
+        printf 'fi\n'
+        printf 'printf "  Re-run the audit to confirm: itm-security audit\\n\\n"\n'
+    } > "$triage"
+    chmod 700 "$triage"
 
     # --- verification script ----------------------------------
     local verify="$REM_INCIDENT_DIR/99-verify.sh"
@@ -650,7 +864,10 @@ rem_generate() {
     say "  Summary   : ${summary##*/}"
     say "  Scripts   : $generated (one per finding at or above $min_sev)"
     say ""
-    say "  Review first:"
+    say "  Walk through them one at a time, deciding y/n per finding:"
+    say "    sudo bash $REM_INCIDENT_DIR/00-triage.sh"
+    say ""
+    say "  Or review first:"
     say "    less $summary"
     say ""
     say "  Then, per finding:"
