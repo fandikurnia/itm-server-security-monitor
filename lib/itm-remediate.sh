@@ -534,7 +534,7 @@ This step only prints the exact commands for you to apply after review."
                 printf '        </FilesMatch>\n'
                 printf '    </Directory>\n'
                 printf '\n'
-                printf 'Then: nginx -t   (or apache2ctl -t)   and reload in a maintenance window.\n'
+                printf 'Then: nginx -t, or apache2ctl -t on Debian/Ubuntu, or apachectl -t on RHEL/AlmaLinux/Rocky.\nReload in a maintenance window.\n'
                 printf 'PLAN\n'
                 printf 'log "plan written to $INCIDENT_DIR/plan-$SAFE_NAME.txt - apply it manually"\n'
             } >> "$file"

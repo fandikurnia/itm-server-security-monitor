@@ -35,7 +35,14 @@ apache_service_name() {
     for svc in apache2 httpd; do
         role_service_active "$svc" 2>/dev/null && { printf '%s' "$svc"; return 0; }
     done
-    printf 'apache2'
+
+    # Nothing is running. Name the unit this family would use, so
+    # the remediation text tells the operator to restart something
+    # that exists on their host.
+    case "$ITM_OS_FAMILY" in
+        rhel) printf 'httpd' ;;
+        *)    printf 'apache2' ;;
+    esac
 }
 
 # ------------------------------------------------------------
@@ -165,7 +172,7 @@ check_apache_documentroot_layout() {
 Framework: $framework
 Reachable from the web: ${exposed:-none detected}
 An HTTP request for /.env or /.git/config is answered by Apache unless a deny rule happens to cover it." \
-            action="Point DocumentRoot at ${root}/public (and set <Directory ${root}/public>) in a maintenance window, then verify with 'apache2ctl -t' before reloading. Until then add explicit deny rules for .env, .git, composer.json, vendor and tests. Do not let this tool change the configuration: a wrong DocumentRoot takes the site down."
+            action="Point DocumentRoot at ${root}/public (and set <Directory ${root}/public>) in a maintenance window, then verify with 'apache2ctl -t' (or 'apachectl -t' on RHEL/AlmaLinux/Rocky) before reloading. Until then add explicit deny rules for .env, .git, composer.json, vendor and tests. Do not let this tool change the configuration: a wrong DocumentRoot takes the site down."
 
     done
 

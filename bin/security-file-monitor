@@ -49,10 +49,65 @@ inotifywait -m -r \
   --format '%T|%e|%w%f' \
   --timefmt '%Y-%m-%d %H:%M:%S' \
   "${VALID_PATHS[@]}" |
+# How long to wait before deciding that a vanished .wants symlink
+# is really gone. systemctl recreates it within milliseconds.
+FIM_WANTS_SETTLE="${FIM_WANTS_SETTLE:-3}"
+FIM_LOG="${FIM_LOG:-/var/log/itm-security/file-monitor.log}"
+
+fim_log() {
+  local dir="${FIM_LOG%/*}"
+  [[ -d "$dir" ]] || return 0
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$FIM_LOG" 2>/dev/null || true
+}
+
+# "systemctl enable" on an already-enabled unit REMOVES the
+# .wants symlink and creates it again. inotify reports the
+# removal, so every reinstall alerts CRITICAL - on every host in
+# the fleet at once, for a change the operator just made.
+#
+# A deployment across ten servers then produces ten CRITICAL
+# alerts about the monitor's own unit being deleted, which is
+# exactly the alert nobody reads by the eleventh time.
+#
+# The distinction that matters is whether the symlink COMES BACK.
+# A re-enable restores it within milliseconds; "systemctl disable"
+# by an intruder does not restore it at all. So wait, look again,
+# and only stay silent when the link is present AND still points
+# at a unit file that exists.
+fim_is_reenable() {
+  local file="$1" event="$2" target
+
+  case "$file" in
+    */*.wants/*|*/*.requires/*) ;;
+    *) return 1 ;;
+  esac
+
+  case "$event" in
+    *DELETE*|*MOVED_FROM*) ;;
+    *) return 1 ;;
+  esac
+
+  sleep "$FIM_WANTS_SETTLE"
+
+  [[ -L "$file" ]] || return 1
+
+  # A symlink that came back pointing at nothing is not a
+  # working re-enable, and is worth reporting.
+  target="$(readlink -f -- "$file" 2>/dev/null)" || return 1
+  [[ -n "$target" && -e "$target" ]] || return 1
+
+  return 0
+}
+
 while IFS='|' read -r EVENT_TIME EVENT FILE; do
   case "$FILE" in
     *.swp|*.swx|*~|*.tmp|*.dpkg-new|*.dpkg-old) continue ;;
   esac
+
+  if fim_is_reenable "$FILE" "$EVENT"; then
+    fim_log "re-enable: $FILE ($EVENT) - symlink restored, not alerting"
+    continue
+  fi
 
   case "$FILE" in
     */authorized_keys|*/authorized_keys2)

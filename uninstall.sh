@@ -245,16 +245,27 @@ if [[ -x "$BACKUP_DIR/security-notify" ]] || command -v curl >/dev/null 2>&1; th
         # shellcheck disable=SC1091
         . /etc/security-monitor/telegram.conf 2>/dev/null || true
         if [[ -n "${BOT_TOKEN:-}" && -n "${CHAT_ID:-}" ]]; then
-            curl -fsS --max-time 10 -X POST \
-                "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                -d "chat_id=${CHAT_ID}" \
-                --data-urlencode "text=🔕 SECURITY MONITOR REMOVED
+            # The token goes in a config file on stdin, never in
+            # argv: anything on the command line is readable by
+            # every local account through ps and /proc.
+            UNINSTALL_BODY="$(mktemp -t itm-uninstall.XXXXXXXX)"
+            chmod 600 "$UNINSTALL_BODY" 2>/dev/null || true
+            cat > "$UNINSTALL_BODY" <<NOTICE
+🔕 SECURITY MONITOR REMOVED
 
 Host    : $(hostname -f 2>/dev/null || hostname)
 Time    : $(date '+%Y-%m-%d %H:%M:%S %Z')
 
 Monitoring has stopped on this host. This is the last message
-you will receive from it." >/dev/null 2>&1 || true
+you will receive from it.
+NOTICE
+            curl -fsS --max-time 10 --config - <<CURLCFG >/dev/null 2>&1 || true
+url = "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+request = "POST"
+data = "chat_id=${CHAT_ID}"
+data-urlencode = "text@${UNINSTALL_BODY}"
+CURLCFG
+            rm -f "$UNINSTALL_BODY"
         fi
     fi
 fi

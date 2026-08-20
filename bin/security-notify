@@ -63,9 +63,25 @@ ${MESSAGE}"
 # already-compromised host that is a credential handed over for
 # free.
 #
+# The message body CANNOT go in that config file. curl parses it
+# one line at a time, so a value stops at the first newline: an
+# alert written inline arrives as its first line and nothing
+# else - every finding reduced to "SECURITY ALERT", indis-
+# tinguishable from every other one.
+#
+# So the body travels through a file instead, referenced with
+# curl's name@file form, which reads the whole file regardless of
+# newlines. The file is created with a private umask and removed
+# on every exit path.
+#
+NOTIFY_BODY="$(mktemp -t itm-notify.XXXXXXXX)" || exit 1
+chmod 600 "$NOTIFY_BODY" 2>/dev/null || true
+trap 'rm -f "$NOTIFY_BODY"' EXIT INT TERM
+printf '%s' "$TEXT" > "$NOTIFY_BODY"
+
 curl -fsS --max-time 10 --config - <<CURLCFG >/dev/null
 url = "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
 request = "POST"
 data = "chat_id=${CHAT_ID}"
-data-urlencode = "text=${TEXT}"
+data-urlencode = "text@${NOTIFY_BODY}"
 CURLCFG
