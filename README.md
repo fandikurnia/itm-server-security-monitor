@@ -330,6 +330,43 @@ The sweep walks the system binary directories only (not the whole filesystem),
 resolves package ownership in batched queries, and is part of the nightly audit
 rather than the three-hourly web scan.
 
+### Network exposure and connection alerting
+
+The `network` module answers three questions on every run, and alerts only on
+the answers that changed or cannot be explained:
+
+| Check | Alerts when |
+|---|---|
+| **Listener baseline** | a port is listening that was **not** listening at the previous check. The first run records the baseline and reports nothing; unchanged listeners are never re-reported |
+| **Inbound sessions** | something outside `trusted_networks.conf` is connected to a service port, and the owning process is unexplained |
+| **Outbound sessions** | a root-owned process holds a session to an address outside the trusted networks |
+| **Hidden listeners** | a port is `LISTEN` in `/proc/net/tcp` but absent from `ss` output — a filtering wrapper |
+
+**"Unclear process" is defined, not guessed.** A socket's owner is scored:
+
+```
+socket has NO owning process visible          +45   (hidden, or another namespace)
+process runs a DELETED executable             +35   (also normal after a package upgrade)
+process runs from a temporary directory       +50
+process name imitates a kernel thread         +55   (the exec -a disguise)
+binary owned by no package                    +25
+listening as root                             +15
+bound to all interfaces                       +15
+```
+
+Severity comes from the total, so a single signal is never CRITICAL on its own.
+A service upgraded in place while running — which leaves `exe (deleted)` — scores
+HIGH at most and says so in the reason text, instead of paging someone at 3am
+because `apt upgrade` ran.
+
+Findings are grouped **per process**, not per socket: one application binding an
+ephemeral port on twelve interfaces produces one finding listing twelve ports,
+not twelve findings.
+
+```bash
+sudo itm-security audit network        # inventory + changes
+```
+
 ### IOC database and incident sweeps
 
 `/etc/security-monitor/ioc/known-iocs.conf` turns one host's incident into

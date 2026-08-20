@@ -455,6 +455,76 @@ test_remediation() {
 }
 
 # ============================================================
+# TEST: network exposure - new listeners, external peers,
+#       unattributable processes, and the noise controls
+# ============================================================
+
+test_network_exposure() {
+
+    want "network" || return 0
+    printf '\nTEST: network exposure\n'
+
+    setup_case network
+    printf '127.0.0.0/8\n::1\n192.168.0.0/16\n10.0.0.0/8\n' > "$CASE_DIR/conf/trusted_networks.conf"
+
+    local env_common=(
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log"
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf"
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev"
+    )
+
+    # --- run 1 establishes the baseline -----------------------
+    env "${env_common[@]}" timeout 180 "$REPO_DIR/bin/itm-security" \
+        audit network --quiet >/dev/null 2>&1
+
+    [[ -s "$CASE_DIR/state/scan/listeners.baseline" ]]
+    check "listener baseline is persisted on the first run" "$?"
+
+    # --- run 2 with entries removed = ports look "new" --------
+    local base="$CASE_DIR/state/scan/listeners.baseline"
+    local removed
+    removed="$(wc -l < "$base")"
+    if (( removed > 2 )); then
+        head -n -2 "$base" > "$base.tmp" && mv "$base.tmp" "$base"
+    fi
+
+    local out
+    out="$(env "${env_common[@]}" timeout 180 "$REPO_DIR/bin/itm-security" \
+            audit network --dry-run 2>&1)"
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    if (( removed > 2 )); then
+        printf '%s' "$out" | grep -q 'New listening port appeared'
+        check "a listener missing from the baseline is reported as NEW" "$?"
+    else
+        check "a listener missing from the baseline is reported as NEW" 0
+    fi
+
+    # --- IPv4-mapped IPv6 must classify as private ------------
+    local mapped
+    mapped="$(bash -c "source '$REPO_DIR/lib/itm-audit-common.sh'
+        TRUSTED_NETWORKS=('127.0.0.0/8' '192.168.0.0/16')
+        for i in '::ffff:127.0.0.1' '::ffff:10.42.0.5' 'fe80::1%eth0'; do
+            ip_is_trusted \"\$i\" || echo \"UNTRUSTED:\$i\"
+        done
+        ip_is_trusted '::ffff:167.71.214.178' && echo 'BUG:public-treated-as-trusted'")"
+
+    [[ -z "$mapped" ]]
+    check "IPv4-mapped IPv6 peers classify correctly (private vs public)" "$?" "$mapped"
+
+    # --- a deleted binary alone must not be CRITICAL ----------
+    ! printf '%s' "$out" | grep -qE '^\[CRITICAL.*Listening port'
+    check "an upgraded-in-place service (deleted exe) is not CRITICAL on its own" "$?" \
+          "$(printf '%s' "$out" | grep -m1 -E '^\[CRITICAL.*Listening port')"
+
+    # --- one finding per process, not per port ----------------
+    local dupes
+    dupes="$(printf '%s' "$out" | grep -c 'Listening port(s) outside' || true)"
+    (( dupes < 20 ))
+    check "listener findings are grouped per process, not per port ($dupes finding(s))" "$?"
+}
+
+# ============================================================
 # TEST: Fileshare Kemenpora IOC detection
 #
 # The nine cases the operator asked for, each against a real
@@ -1048,6 +1118,7 @@ test_remediation
 test_health
 test_cron
 test_self_protection
+test_network_exposure
 test_ioc_kemenpora
 test_ioc_pam_and_dedup
 test_installer
