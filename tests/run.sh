@@ -1209,6 +1209,80 @@ test_systemd_reasons() {
     check "no CRITICAL/HIGH systemd or IOC finding is missing its reasons" "$?" "$missing"
 }
 
+# ------------------------------------------------------------
+# Reinstalling must not page the whole fleet.
+#
+# "systemctl enable" on an already-enabled unit removes the
+# .wants symlink and recreates it. inotify sees the removal, so
+# an Ansible run across ten servers produced ten CRITICAL alerts
+# saying the security monitor's own unit had been DELETED - all
+# of them caused by the operator's own deployment.
+#
+# The distinction is whether the link comes back. An intruder
+# running "systemctl disable" leaves it gone.
+# ------------------------------------------------------------
+test_fim_reenable() {
+
+    want "fim-reenable" || return 0
+    printf '\nTEST: unit re-enable is not a deletion\n'
+
+    setup_case fim-reenable
+
+    local fn="$CASE_DIR/fn.sh"
+    awk '/^fim_is_reenable\(\) \{/,/^}/' "$REPO_DIR/bin/security-file-monitor" > "$fn"
+    [[ -s "$fn" ]]
+    check "the re-enable check exists in security-file-monitor" "$?"
+
+    mkdir -p "$CASE_DIR/multi-user.target.wants" "$CASE_DIR/units"
+    printf '[Service]\n' > "$CASE_DIR/units/security-file-monitor.service"
+    local link="$CASE_DIR/multi-user.target.wants/security-file-monitor.service"
+    local unit="$CASE_DIR/units/security-file-monitor.service"
+    ln -s "$unit" "$link"
+
+    # --- systemctl enable: gone and back again ---------------
+    (
+        source "$fn"; FIM_WANTS_SETTLE=2
+        ( sleep 0.3; ln -sfn "$unit" "$link" ) &
+        rm -f "$link"
+        fim_is_reenable "$link" "DELETE"
+    )
+    check "a recreated .wants symlink is recognised as a re-enable" "$?"
+
+    # --- systemctl disable: gone for good --------------------
+    (
+        source "$fn"; FIM_WANTS_SETTLE=1
+        rm -f "$link"
+        ! fim_is_reenable "$link" "DELETE"
+    )
+    check "a symlink that stays gone still alerts" "$?"
+
+    # --- back, but pointing at nothing -----------------------
+    (
+        source "$fn"; FIM_WANTS_SETTLE=1
+        ln -sfn "$CASE_DIR/units/absent.service" "$link"
+        ! fim_is_reenable "$link" "DELETE"
+    )
+    check "a dangling restored symlink still alerts" "$?"
+
+    # --- a real unit file is never given the grace period ----
+    (
+        source "$fn"; FIM_WANTS_SETTLE=1
+        ! fim_is_reenable "$unit" "DELETE"
+    )
+    check "a deleted unit file alerts immediately" "$?"
+
+    # --- and a CREATE in .wants is not swallowed -------------
+    ln -sfn "$unit" "$link"
+    (
+        source "$fn"; FIM_WANTS_SETTLE=1
+        ! fim_is_reenable "$link" "CREATE"
+    )
+    check "a CREATE event is not treated as a re-enable" "$?"
+
+    grep -q 'FIM_WANTS_SETTLE' "$REPO_DIR/bin/security-file-monitor"
+    check "the settle time is configurable" "$?"
+}
+
 test_notify_secret() {
 
     want "secret" || return 0
@@ -1834,6 +1908,7 @@ test_apache_multidistro
 test_systemd_override
 test_systemd_reasons
 test_notify_secret
+test_fim_reenable
 test_health
 test_cron
 test_self_protection
