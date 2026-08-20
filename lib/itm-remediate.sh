@@ -53,6 +53,13 @@ REMEDIATE_BASE_DIR="${REMEDIATE_BASE_DIR:-/root/forensic}"
 # Helpers
 # ------------------------------------------------------------
 
+# The quarantine filename, computed the same way the generated
+# script computes it, so rollback instructions can be printed as
+# literal copy-pasteable paths instead of unexpanded variables.
+rem_safe_name() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+}
+
 rem_slug() {
     # module + file basename, not the whole path: incident
     # directories are read by a human under pressure.
@@ -285,7 +292,7 @@ If the application imports this file, that feature breaks until it is restored."
                 printf 'log "review the list above: an upload rarely arrives alone"\n'
             } >> "$file"
             rem_footer "$file" \
-"mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\"
+"mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path'
 Then re-run: itm-security audit webshell gambling seo"
             ;;
 
@@ -305,7 +312,7 @@ uploads keep working but any PHP behaviour configured here stops."
                 printf 'log "every file listed above must be reviewed before it is trusted"\n'
             } >> "$file"
             rem_footer "$file" \
-"mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\"
+"mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path'
 Longer term: set AllowOverride None for this directory in the Apache config."
             ;;
 
@@ -336,7 +343,7 @@ appear in logs. Read the usage report printed above FIRST: if a unit calls it, d
 that unit before moving the binary, or the service will crash-loop."
             rem_quarantine_move "$file"
             rem_footer "$file" \
-"mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\" && chmod 755 \"$path\"
+"mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path' && chmod 755 '$path'
 The persistence that installed it is the real problem: review the usage report."
             ;;
 
@@ -371,8 +378,8 @@ Check the unit file in the evidence directory before continuing."
             } >> "$file"
             rem_footer "$file" \
 "systemctl unmask \"\$UNIT\"
-mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\"
-systemctl daemon-reload && systemctl enable --now \"\$UNIT\""
+mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path'
+systemctl daemon-reload && systemctl enable --now '$(basename "$path")'"
             ;;
 
         # ---- PAM credential stealer -----------------------------
@@ -409,8 +416,8 @@ The full PAM directory has already been backed up to the evidence folder."
                 printf 'log "TEST AUTHENTICATION NOW, from a second session, before closing this one"\n'
             } >> "$file"
             rem_footer "$file" \
-"cp -a \"\$EVIDENCE/\$(basename \"$path\").before\" \"$path\"
-Full restore: tar -xzf \"\$EVIDENCE/pam.d-backup.tar.gz\" -C /etc
+"cp -a '$REM_INCIDENT_DIR/evidence/$(basename "$path").before' '$path'
+Full restore: tar -xzf '$REM_INCIDENT_DIR/evidence/pam.d-backup.tar.gz' -C /etc
 Rotate every credential used on this host: the stealer saw them in cleartext."
             ;;
 
@@ -430,7 +437,7 @@ depended on it changes behaviour."
                 printf 'log "output of $CMD can be trusted again once this points at /usr/bin or /bin"\n'
             } >> "$file"
             rem_footer "$file" \
-"mv -- \"\$QUARANTINE/\$SAFE_NAME\" \"$path\" && chmod 755 \"$path\""
+"mv -- '$REM_INCIDENT_DIR/quarantine/$(rem_safe_name "$path")' '$path' && chmod 755 '$path'"
             ;;
 
         # ---- world-writable data directory ----------------------

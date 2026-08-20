@@ -1149,6 +1149,79 @@ test_triage() {
     check "the log points at the rollback for anything contained" "$?"
 }
 
+test_systemd_override() {
+
+    want "override" || return 0
+    printf '\nTEST: local override of a packaged unit\n'
+
+    setup_case override
+    mkdir -p "$CASE_DIR"/{etc,lib}
+    printf '[Unit]\nDescription=Tuning Daemon\n[Service]\nExecStart=/bin/true -l\n' > "$CASE_DIR/lib/tuned.service"
+    printf '[Unit]\nDescription=Tuning Daemon\n[Service]\nExecStart=/bin/true -l --custom\n' > "$CASE_DIR/etc/tuned.service"
+    printf '[Unit]\nDescription=x\n[Service]\nExecStart=/tmp/payload\n' > "$CASE_DIR/etc/evil.service"
+
+    local out
+    out="$(bash -c "
+        source '$REPO_DIR/lib/itm-audit-common.sh'
+        source '$REPO_DIR/lib/itm-web-common.sh'
+        ITM_CONF_DIR='$CASE_DIR/conf'; ITM_LOG_DIR='$CASE_DIR/log'
+        ITM_STATE_DIR='$CASE_DIR/state'; ITM_SCAN_STATE_DIR='$CASE_DIR/state/scan'
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source '$REPO_DIR/modules/audit_systemd.sh'
+        is_pkg_owned() { [[ \"\$1\" == '$CASE_DIR/lib/tuned.service' ]]; }
+        pkg_owner() { printf 'tuned'; }
+        SYSTEMD_UNIT_DIRS='$CASE_DIR/etc $CASE_DIR/lib'
+        module_begin systemd 'Systemd'
+        check_unit_files
+        audit_runtime_cleanup" 2>&1)"
+
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    printf '%s' "$out" | grep -B1 'etc/tuned.service' | grep -qE '^\[LOW.*Local override'
+    check "a unit overriding a packaged one is LOW, not unknown persistence" "$?"
+
+    printf '%s' "$out" | grep -B1 'etc/evil.service' | grep -qE '^\[(HIGH|CRITICAL)'
+    check "a genuinely foreign unit is still HIGH/CRITICAL" "$?"
+
+    printf '%s' "$out" | grep -q 'Do NOT quarantine it without checking'
+    check "the override finding warns against quarantining it" "$?"
+}
+
+test_systemd_reasons() {
+
+    want "reasons" || return 0
+    printf '\nTEST: every actionable finding explains itself\n'
+
+    # A triage prompt showing "why : -" gives the operator nothing
+    # to judge by. This is what caused a legitimate service to be
+    # quarantined on a production host.
+    local missing
+    missing="$(awk '
+        /add_finding (CRITICAL|HIGH)/ {f=1; buf=""; id=""}
+        f {
+            buf = buf $0 "\n"
+            if ($0 ~ /id="/) { match($0, /id="[^"]*/); id = substr($0, RSTART+4, RLENGTH-4) }
+            if ($0 ~ /action=/) { f=0; if (buf !~ /reasons=/) print FILENAME ":" id }
+        }' "$REPO_DIR"/modules/audit_systemd.sh "$REPO_DIR"/modules/audit_ioc.sh)"
+
+    [[ -z "$missing" ]]
+    check "no CRITICAL/HIGH systemd or IOC finding is missing its reasons" "$?" "$missing"
+}
+
+test_notify_secret() {
+
+    want "secret" || return 0
+    printf '\nTEST: the Telegram token never reaches argv\n'
+
+    grep -q -- '--config -' "$REPO_DIR/bin/security-notify"
+    check "security-notify passes curl options on stdin" "$?"
+
+    ! grep -E '^curl' "$REPO_DIR/bin/security-notify" | grep -q 'BOT_TOKEN'
+    check "the token is not on the curl command line" "$?" \
+          "$(grep -E '^curl' "$REPO_DIR/bin/security-notify")"
+}
+
 test_health() {
 
     want "health" || return 0
@@ -1272,6 +1345,9 @@ test_non_web_host
 test_safety_invariants
 test_remediation
 test_triage
+test_systemd_override
+test_systemd_reasons
+test_notify_secret
 test_health
 test_cron
 test_self_protection

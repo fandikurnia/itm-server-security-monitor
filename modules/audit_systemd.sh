@@ -165,6 +165,11 @@ check_unit_files() {
             add_finding CRITICAL \
                 "Systemd unit matching a known malicious persistence name from a previous incident" \
                 id="known-bad-unit:$unit" \
+                event=SYSTEMD_KNOWN_BAD_UNIT \
+                confidence=95 \
+                reasons="Unit name '$unit' matches KNOWN_BAD_UNITS, recorded from a confirmed compromise on this estate
+The name alone is the match - verify the ExecStart and the binary before acting
+A legitimate service that happens to share the name would look identical here" \
                 path="$file" \
                 process="state=$(unit_active_state "$unit")" \
                 evidence="Unit: $unit
@@ -182,6 +187,51 @@ package=$(pkg_owner "$file") mtime=$(file_mtime_human "$file")" \
         # leaves its persistence behind.
         local unit_owned=0
         is_pkg_owned "$file" && unit_owned=1
+
+        # A unit in /etc/systemd/system that shadows a
+        # package-owned unit of the same name is an ADMINISTRATOR
+        # OVERRIDE, which is the documented way to customise a
+        # service. dpkg does not own the override, so a naive
+        # ownership test calls it a dropped unit.
+        #
+        # This misfired on a production host: tuned.service, a
+        # stock tuning daemon with a local override, was reported
+        # as unknown persistence and an operator quarantined it.
+        # Expressed as a relationship rather than a hardcoded
+        # path: any unit outside the vendor directories that
+        # shadows a package-owned unit of the same name is an
+        # override, wherever the distribution keeps its units.
+        local unit_is_override=0 packaged_original="" libdir
+        if (( unit_owned == 0 )); then
+            for libdir in $SYSTEMD_UNIT_DIRS; do
+                [[ "$libdir" == "$dir" ]] && continue
+                [[ -f "$libdir/$unit" ]] || continue
+                if is_pkg_owned "$libdir/$unit"; then
+                    unit_is_override=1
+                    packaged_original="$libdir/$unit"
+                    break
+                fi
+            done
+        fi
+
+        if (( unit_is_override )); then
+            add_finding LOW \
+                "Local override of a packaged systemd unit" \
+                id="unit-local-override:$unit" \
+                event=SYSTEMD_LOCAL_OVERRIDE \
+                path="$file" \
+                confidence=70 \
+                reasons="A unit of this name is shipped by a package at ${packaged_original}
+The copy in /etc/systemd/system overrides it, which is the supported way to customise a service
+This is a change-review item, NOT unknown persistence: the service itself is packaged software
+Do NOT quarantine it without checking: the packaged service stays installed either way, and removing a legitimate override stops it" \
+                process="state=$(unit_active_state "$unit")" \
+                evidence="override : $file (mtime $(file_mtime_human "$file"))
+packaged : $packaged_original (package $(pkg_owner "$packaged_original"))
+$(diff -u "$packaged_original" "$file" 2>/dev/null | head -12 | truncate_text_stdin 500)" \
+                action="Confirm the override was made deliberately - compare it with the packaged unit above. Do NOT quarantine it without checking: removing the override does not remove the service, and quarantining a legitimate one stops it."
+            continue
+        fi
 
         # ---- executable targets --------------------------------
         while IFS= read -r execline; do
@@ -210,6 +260,9 @@ package=$(pkg_owner "$file") mtime=$(file_mtime_human "$file")" \
                 add_finding HIGH \
                     "Locally created systemd unit points at an executable that does not exist" \
                     id="unit-missing-exec:$unit:$bin" \
+                reasons="The unit is owned by no package and its ExecStart target does not exist
+This is what a quarantined implant leaves behind: the binary removed, the persistence not
+It is also what an incomplete package removal leaves behind" \
                     path="$file" \
                     process="ExecStart target: $bin | state=$(unit_active_state "$unit")" \
                     evidence="The unit is owned by no package and references $bin, which is absent from disk. This is what a quarantined implant leaves behind when the binary was removed and the persistence was not." \
@@ -223,6 +276,8 @@ package=$(pkg_owner "$file") mtime=$(file_mtime_human "$file")" \
                 add_finding CRITICAL \
                     "Systemd unit executes a binary from a temporary or user writable directory" \
                     id="unit-volatile-exec:$unit:$bin" \
+                reasons="ExecStart runs a binary from a temporary directory
+No packaged service ever executes from /tmp, /var/tmp or /dev/shm" \
                     path="$file" \
                     process="ExecStart target: $bin | state=$(unit_active_state "$unit")" \
                     evidence="$bin sha256=$(file_sha256 "$bin") mtime=$(file_mtime_human "$bin") owner=$(stat -c '%U:%G' "$bin" 2>/dev/null)" \
@@ -236,6 +291,8 @@ package=$(pkg_owner "$file") mtime=$(file_mtime_human "$file")" \
                 add_finding HIGH \
                     "Systemd unit executes a binary from a home directory" \
                     id="unit-home-exec:$unit:$bin" \
+                reasons="ExecStart runs a binary from a home directory
+Whoever can write that directory controls whatever user the unit runs as" \
                     path="$file" \
                     process="ExecStart target: $bin | state=$(unit_active_state "$unit")" \
                     evidence="$bin owner=$(stat -c '%U:%G' "$bin" 2>/dev/null) mode=$(stat -c '%a' "$bin" 2>/dev/null) sha256=$(file_sha256 "$bin")" \
@@ -249,6 +306,8 @@ package=$(pkg_owner "$file") mtime=$(file_mtime_human "$file")" \
                 add_finding HIGH \
                     "Systemd unit executes a binary that is writable by a non-root account" \
                     id="unit-writable-exec:$unit:$bin" \
+                reasons="The ExecStart target is writable by a non-root account
+Any account that can write it gains that unit's privileges at the next start" \
                     path="$file" \
                     process="ExecStart target: $bin | state=$(unit_active_state "$unit")" \
                     evidence="$bin mode=$(stat -c '%a' "$bin" 2>/dev/null) owner=$(stat -c '%U:%G' "$bin" 2>/dev/null)" \
@@ -263,6 +322,9 @@ package=$(pkg_owner "$file") mtime=$(file_mtime_human "$file")" \
                         add_finding HIGH \
                             "Systemd unit executes an unpackaged binary placed in a system directory" \
                             id="unit-unowned-exec:$unit:$bin" \
+                reasons="ExecStart runs a binary in a system directory that no package owns
+This is the pattern of the fake units seen on this estate: a real looking unit plus a dropped binary
+Locally compiled software looks identical, so the question is whether anyone can account for it" \
                             path="$file" \
                             process="ExecStart target: $bin | state=$(unit_active_state "$unit")" \
                             evidence="$bin is owned by no package. sha256=$(file_sha256 "$bin") mtime=$(file_mtime_human "$bin")
@@ -283,6 +345,8 @@ $(unit_exec_lines "$file" | head -3)" \
                 add_finding CRITICAL \
                     "Systemd unit runs a network or encoding command directly from Exec=" \
                     id="unit-suspicious-exec:$unit" \
+                reasons="The unit is owned by no package AND its Exec line runs a network or encoding command
+Downloaders and reverse shells are commonly wired straight into Exec=" \
                     path="$file" \
                     process="state=$(unit_active_state "$unit")" \
                     evidence="Exec line: $(truncate_text "$execline" 300)" \
@@ -303,6 +367,8 @@ $(unit_exec_lines "$file" | head -3)" \
                 add_finding MEDIUM \
                     "Locally created systemd unit added or modified in the last ${SYSTEMD_RECENT_DAYS} days" \
                     id="unit-recent-local:$unit" \
+                reasons="A unit not owned by any package was created or modified recently
+Local units are normal for application deployments: this is a change-review item, not a detection" \
                     path="$file" \
                     process="state=$(unit_active_state "$unit")" \
                     evidence="mtime=$(file_mtime_human "$file")
@@ -319,6 +385,8 @@ $(unit_exec_lines "$file" | head -3)" \
                     add_finding HIGH \
                         "Unit uses a distribution style name but is owned by no package" \
                         id="unit-masquerade:$unit" \
+                reasons="The unit name follows a distribution naming convention but belongs to no package
+Name imitation is used to survive a quick read of systemctl output" \
                         path="$file" \
                         process="state=$(unit_active_state "$unit")" \
                         evidence="Unit $unit imitates a system component naming convention. mtime=$(file_mtime_human "$file")

@@ -53,9 +53,19 @@ Time       : ${NOW}
 
 ${MESSAGE}"
 
-curl -fsS --max-time 10 \
-  -X POST \
-  "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-  -d "chat_id=${CHAT_ID}" \
-  --data-urlencode "text=${TEXT}" \
-  >/dev/null
+#
+# The token is passed to curl through a config file on stdin,
+# never on the command line.
+#
+# Anything in argv is world readable: a plain "curl .../bot<TOKEN>/..."
+# shows the bot token to every local account in the output of ps,
+# and to anything that reads /proc/<pid>/cmdline. On a shared or
+# already-compromised host that is a credential handed over for
+# free.
+#
+curl -fsS --max-time 10 --config - <<CURLCFG >/dev/null
+url = "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+request = "POST"
+data = "chat_id=${CHAT_ID}"
+data-urlencode = "text=${TEXT}"
+CURLCFG
