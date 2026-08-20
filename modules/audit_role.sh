@@ -230,13 +230,32 @@ role_detect_php() {
     fi
 
     # Apache -> mod_php or php-fpm handler
+    # The control program is named differently per family:
+    # apache2ctl on Debian/Ubuntu, apachectl or httpd on
+    # RHEL/AlmaLinux/Rocky. Probing for one name only means a
+    # PHP-serving Rocky host is classified as not running a PHP
+    # application, and every web module then skips it.
     if [[ "$ROLE_WEB_SERVER" == "apache" ]]; then
-        if have_cmd apache2ctl && run_timeout "$CMD_TIMEOUT" apache2ctl -M 2>/dev/null | grep -qi 'php\|proxy_fcgi'; then
-            wired=1
-            role_note "apache PHP module or proxy_fcgi loaded"
-        elif have_cmd httpd && run_timeout "$CMD_TIMEOUT" httpd -M 2>/dev/null | grep -qi 'php\|proxy_fcgi'; then
-            wired=1
-            role_note "httpd PHP module or proxy_fcgi loaded"
+        local apache_ctl=""
+        if declare -F web_apache_ctl >/dev/null 2>&1; then
+            apache_ctl="$(web_apache_ctl || true)"
+        else
+            # itm-web-common.sh is sourced before this module, but
+            # it is loaded behind a readability check. Losing PHP
+            # detection because a helper is missing would silently
+            # exclude the host from every web module, so the probe
+            # is repeated here rather than assumed.
+            local c
+            for c in apache2ctl apachectl httpd; do
+                have_cmd "$c" && { apache_ctl="$c"; break; }
+            done
+        fi
+
+        if [[ -n "$apache_ctl" ]]; then
+            if run_timeout "$CMD_TIMEOUT" "$apache_ctl" -M 2>/dev/null | grep -qi 'php\|proxy_fcgi'; then
+                wired=1
+                role_note "apache PHP module or proxy_fcgi loaded (via $apache_ctl)"
+            fi
         fi
     fi
 

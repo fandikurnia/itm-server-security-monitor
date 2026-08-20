@@ -1255,6 +1255,161 @@ test_notify_secret() {
 # Neither may be dropped from the shipped list: an indicator is
 # only useful because every other host is checked against it.
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# Generated PAM files, on both supported families.
+#
+# Removing the injected line is only half the fix when the file
+# is produced from a template: authselect rewrites the whole file
+# on RHEL/AlmaLinux/Rocky, pam-auth-update rewrites its managed
+# block on Debian/Ubuntu. If the template carries the hook, the
+# line returns on every host that regenerates.
+#
+# The warning has to live in the reasons list, not in evidence:
+# the console and the triage walker print every reason but only
+# the first line of evidence, and triage is where the operator
+# decides.
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# Apache is called something different on each family.
+#
+#   Debian / Ubuntu          apache2ctl, service apache2
+#   RHEL / AlmaLinux / Rocky apachectl or httpd, service httpd
+#
+# Probing only for apache2ctl classifies a PHP-serving Rocky host
+# as "not a PHP application", and every web module then skips it:
+# the host reports nothing and looks clean.
+# ------------------------------------------------------------
+test_apache_multidistro() {
+
+    want "apache-distro" || return 0
+    printf '\nTEST: Apache detected under every family name\n'
+
+    setup_case apache-distro
+    mkdir -p "$CASE_DIR/stub"
+
+    local ctl out
+    for ctl in apache2ctl apachectl httpd; do
+
+        rm -f "$CASE_DIR/stub/"*
+        printf '#!/bin/sh\necho " proxy_fcgi_module (shared)"\n' > "$CASE_DIR/stub/$ctl"
+        chmod 755 "$CASE_DIR/stub/$ctl"
+
+        out="$(
+            PATH="$CASE_DIR/stub:$PATH"
+            source "$REPO_DIR/lib/itm-audit-common.sh"
+            source "$REPO_DIR/lib/itm-web-common.sh"
+            audit_load_config; audit_detect_os; audit_detect_host
+            ITM_DRY_RUN=1; audit_runtime_init
+            source "$REPO_DIR/modules/audit_role.sh"
+            ROLE_WEB_SERVER=apache
+            role_detect_php >/dev/null 2>&1
+            printf '%s' "${ROLE_EVIDENCE:-}"
+        2>&1 )"
+
+        printf '%s' "$out" | grep -q "via $ctl"
+        check "PHP wiring is detected through $ctl" "$?"
+    done
+
+    # The service name reported when nothing is running must be a
+    # unit that exists on the host, or the remediation text tells
+    # the operator to restart something that is not there.
+    local svc
+    svc="$(
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_role.sh"
+        source "$REPO_DIR/modules/audit_apache.sh"
+        ITM_OS_FAMILY=rhel; apache_service_name
+    2>/dev/null )"
+    [[ "$svc" == "httpd" ]]
+    check "the RHEL-family fallback service name is httpd" "$?"
+
+    svc="$(
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_role.sh"
+        source "$REPO_DIR/modules/audit_apache.sh"
+        ITM_OS_FAMILY=debian; apache_service_name
+    2>/dev/null )"
+    [[ "$svc" == "apache2" ]]
+    check "the Debian-family fallback service name is apache2" "$?"
+}
+
+test_pam_generated_multidistro() {
+
+    want "pam-generated" || return 0
+    printf '\nTEST: generated PAM files on RHEL and Debian families\n'
+
+    setup_case pam-generated
+    mkdir -p "$CASE_DIR/rhel" "$CASE_DIR/deb" "$CASE_DIR/plain"
+
+    printf '#%%PAM-1.0\n# This file is auto-generated.\n# User changes will be destroyed the next time authselect is run.\nauth optional pam_exec.so quiet expose_authtok /usr/bin/x86_64-linux-gnu-op\nauth sufficient pam_unix.so\n' \
+        > "$CASE_DIR/rhel/system-auth"
+
+    printf '# As of pam 1.0.1-6, this file is managed by pam-auth-update by default.\nauth [success=2 default=ignore] pam_unix.so nullok\n# end of pam-auth-update config\n#auth optional pam_exec.so quiet expose_authtok /usr/bin/x86_64-linux-gnu-op\n' \
+        > "$CASE_DIR/deb/common-auth"
+
+    # a hand-written file must NOT collect the warning
+    printf 'auth required pam_env.so\nauth optional pam_exec.so expose_authtok /usr/bin/evil\n' \
+        > "$CASE_DIR/plain/custom"
+
+    local out fam
+    for fam in rhel deb plain; do
+        out="$(
+            PAM_DIR="$CASE_DIR/$fam"
+            source "$REPO_DIR/lib/itm-audit-common.sh"
+            source "$REPO_DIR/lib/itm-web-common.sh"
+            audit_load_config; audit_detect_os; audit_detect_host
+            ITM_DRY_RUN=1; audit_runtime_init
+            source "$REPO_DIR/modules/audit_pam.sh"
+            module_begin pam 'PAM'
+            check_pam_exec; check_pam_exec_dormant
+            audit_runtime_cleanup
+        2>&1 )"
+
+        case "$fam" in
+            rhel)
+                printf '%s' "$out" | grep -q 'GENERATED by authselect'
+                check "authselect is named on a RHEL-family file" "$?"
+                printf '%s' "$out" | grep -q 'template must be checked'
+                check "the RHEL warning reaches the reasons list" "$?"
+                ;;
+            deb)
+                printf '%s' "$out" | grep -q 'GENERATED by pam-auth-update'
+                check "pam-auth-update is named on a Debian-family file" "$?"
+                printf '%s' "$out" | grep -q 'template must be checked'
+                check "the Debian warning reaches the reasons list" "$?"
+                ;;
+            plain)
+                ! printf '%s' "$out" | grep -q 'GENERATED by'
+                check "a hand-written PAM file gets no generator warning" "$?"
+                printf '%s' "$out" | grep -qE '^\[CRITICAL'
+                check "the hook itself is still CRITICAL" "$?"
+                ;;
+        esac
+    done
+
+    # every active-hook finding must carry reasons: a finding that
+    # shows "why : -" in triage is what got a legitimate unit
+    # quarantined once already.
+    out="$(
+        PAM_DIR="$CASE_DIR/plain"
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_pam.sh"
+        module_begin pam 'PAM'; check_pam_exec; audit_runtime_cleanup
+    2>&1 )"
+
+    printf '%s' "$out" | grep -A3 'expose_authtok' | grep -q 'ACTIVE pam_exec hook runs'
+    check "an active pam_exec finding explains itself in reasons" "$?"
+}
+
 test_ioc_toolchain_variants() {
 
     want "ioc-triplet" || return 0
@@ -1579,6 +1734,8 @@ test_pam_remediation_edit
 test_pam_remediation_script
 test_ioc_masked_unit
 test_ioc_toolchain_variants
+test_pam_generated_multidistro
+test_apache_multidistro
 test_systemd_override
 test_systemd_reasons
 test_notify_secret
