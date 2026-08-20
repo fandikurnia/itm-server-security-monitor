@@ -819,6 +819,24 @@ EOS
     printf '%s' "$out" | grep -q 'SSH session terminated'
     check "termination is reported with event SSH_SESSION_TERMINATED" "$?"
 
+    # --- never disconnect the session running the audit --------
+    : > "$TERMINATE_LOG"
+    local selfout
+    selfout="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        SSH_SESSION_FIXTURE="$FIXTURES/ssh/sessions.txt" SSH_SESSION_MODE=enforce \
+        SSH_TERMINATE_CMD="$CASE_DIR/fake-terminate" XDG_SESSION_ID=c3 \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit ssh_session --dry-run 2>&1)"
+
+    ! grep -q '^c3$' "$TERMINATE_LOG"
+    check "the session running the audit is NEVER terminated" "$?" \
+          "terminated: $(tr '\n' ' ' < "$TERMINATE_LOG")"
+
+    printf '%s' "$selfout" | grep -q 'session running the audit'
+    check "self-session is reported instead, with the reason" "$?"
+
     # idempotency: a second run must not terminate the same session twice
     : > "$TERMINATE_LOG"
     out="$(ssh_run enforce SSH_TIMEOUT_EXEMPT_USERS="backupsvc" ITM_DRY_RUN=0 2>/dev/null)"
