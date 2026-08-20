@@ -20,6 +20,16 @@
 # directories, PAM/systemd/cron configuration and the web roots
 # - not across the whole filesystem.
 #
+# NAMING
+#
+# Entries are labelled by TECHNIQUE, never by the host or site
+# they were first seen on. The same file is deployed to every
+# server, and an indicator recovered from one host is only
+# useful because it is checked on all the others. Which host a
+# finding came from is recorded automatically in the finding
+# itself (hostname, private IP, timestamp) - it does not belong
+# in a shared indicator list.
+#
 # IMPORTANT
 #
 # This list only ever describes the LAST attack. The generic
@@ -30,7 +40,7 @@
 
 
 # ------------------------------------------------------------
-# INCIDENT: formppid.kemenpora.go.id, 2026-08
+# INCIDENT: PAM credential harvester (2026-08)
 #
 # PAM credential stealer. A pam_exec.so hook with
 # expose_authtok in /etc/pam.d/common-auth piped the cleartext
@@ -39,7 +49,7 @@
 #
 # The payload name imitates the Debian toolchain triplet:
 #
-#   real   x86_64-linux-gnu-*
+#   real    x86_64-linux-gnu-*
 #   payload x86_65-linux-gnu-op      <- 4 changed to 5
 #
 # By the time it was found the PAM line had been COMMENTED OUT
@@ -63,7 +73,7 @@ string:/sudo/socket.php
 
 
 # ------------------------------------------------------------
-# INCIDENT: previous estate compromise
+# INCIDENT: fake systemd units with dropped binaries
 #
 # Fake systemd units with binaries dropped into /usr/bin, and
 # wrapper binaries in /usr/local/bin hiding processes and
@@ -76,7 +86,7 @@ string:/sudo/socket.php
 
 
 # ============================================================
-# INCIDENT: Fileshare Kemenpora, 2026-08
+# INCIDENT: gsocket implant with systemd persistence (2026-08)
 #
 # gsocket family implant with systemd persistence, forensic
 # command wrappers, a PAM credential hook and a live C2 channel.
@@ -138,3 +148,28 @@ string:x86_65-linux-gnu-op
 # Process masquerading as a kernel thread is detected
 # structurally (bracketed argv[0] with a real executable), so it
 # needs no string entry here.
+
+
+# ============================================================
+# INCIDENT: PAM harvester posting to an external collector (2026-08)
+#
+# PAM credential harvester: a pam_exec.so hook with
+# expose_authtok handed the cleartext token to a helper that
+# posted it to an external collector.
+#
+# The C2 endpoints live in known-c2.list as well, because that
+# file is checked against live sockets and DNS; the entries here
+# make them match inside files and configuration too.
+# ============================================================
+
+sha256:815ce61c73f0217f2149e8018613f7674d6fad71a52c02385a1bf7a1d6ef0d44
+sha256:a941f24212ea34ed313f36246e56722f2a79fb4777fce82d7f5b87acef1109f1
+
+ip:104.248.150.145
+
+domain:petupmanluy.xyz
+domain:jdih-kemenpora.edgeone.app
+domain:jdih-kemenpora-plw72286ru.edgeone.app
+
+string:/sz/socket.php
+string:/sudo/socket.php

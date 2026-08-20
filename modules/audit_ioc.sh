@@ -62,6 +62,40 @@ ioc_load_database() {
     (( ${#KNOWN_IOCS[@]} > 0 ))
 }
 
+# ------------------------------------------------------------
+# Standalone C2 watchlist
+#
+# Kept separate from known-iocs.conf on purpose: during an
+# incident somebody needs to add an address in ten seconds,
+# without learning a file format or touching source code.
+# ------------------------------------------------------------
+
+ITM_C2_LIST="${ITM_C2_LIST:-$ITM_CONF_DIR/known-c2.list}"
+
+C2_WATCHLIST=()
+
+ioc_load_c2_watchlist() {
+
+    local line
+
+    C2_WATCHLIST=()
+
+    [[ -r "$ITM_C2_LIST" ]] || return 1
+
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="${line//[[:space:]]/}"
+        [[ -z "$line" ]] && continue
+        C2_WATCHLIST+=("$line")
+    done < "$ITM_C2_LIST"
+
+    (( ${#C2_WATCHLIST[@]} > 0 ))
+}
+
+c2_entry_is_ip() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$1" == *:*:* ]]
+}
+
 ioc_entries_of_type() {
     local want="$1" entry
     for entry in ${KNOWN_IOCS[@]+"${KNOWN_IOCS[@]}"}; do
@@ -126,10 +160,26 @@ ioc_check_unpackaged_system_binaries() {
         # Toolchain triplet imitation: x86_64-linux-gnu-* is a
         # real prefix, x86_65-linux-gnu-* is not.
         if [[ "$name" =~ ^(x86|i[36]86|aarch|arm|amd)[0-9_]*-[a-z]+-[a-z]+ ]]; then
-            if ! is_pkg_owned "$file"; then
-                score_add 35 "name imitates a compiler toolchain prefix - blends into /usr/bin listings"
-            fi
+            score_add 45 "name imitates a compiler toolchain prefix - blends into /usr/bin listings"
         fi
+
+        # Other system naming conventions used as camouflage. The
+        # real ones are all package owned; this file is not.
+        case "$name" in
+            systemd-*|dbus-*|udev*|kworker*|kthread*|ksoftirq*|migration*|rcu_*)
+                score_add 45 "name imitates a systemd/kernel component while belonging to no package" ;;
+            lib*.so*|ld-*)
+                score_add 35 "executable named like a shared library" ;;
+        esac
+
+        # /usr/local is outside dpkg's remit by design, so an
+        # unowned file there is expected - but it is also exactly
+        # where the forensic-tool wrappers were planted on this
+        # estate. Reviewable, not automatically malicious.
+        case "$file" in
+            /usr/local/*)
+                score_add 25 "in /usr/local, which no package manages: it must be accounted for by an administrator" ;;
+        esac
 
         # Payload characteristics.
         local ftype
@@ -350,6 +400,12 @@ ioc_check_c2_connections() {
     while IFS= read -r ip; do
         [[ -n "$ip" ]] && ips+=("$ip")
     done < <(ioc_entries_of_type ip)
+
+    # The standalone watchlist contributes its IP entries too.
+    local w
+    for w in ${C2_WATCHLIST[@]+"${C2_WATCHLIST[@]}"}; do
+        c2_entry_is_ip "$w" && ips+=("$w")
+    done
 
     (( ${#ips[@]} > 0 )) || { add_skip "no IOC IP addresses configured"; return 0; }
 
@@ -580,6 +636,85 @@ package=$(pkg_owner "$file")" \
 }
 
 # ------------------------------------------------------------
+# Can this host still reach the C2 by name?
+#
+# A live socket is the strongest signal, and its absence proves
+# nothing: an implant that beacons hourly is idle most of the
+# time. Resolving the watchlist domains answers a different and
+# still useful question - whether the path out is open, and
+# whether anything on this host has the name cached or pinned in
+# /etc/hosts.
+#
+# Resolution is a read-only DNS query. No connection is made to
+# the address.
+# ------------------------------------------------------------
+
+ioc_check_c2_dns() {
+
+    local entry found=0 resolved hostsfile_hit dig_bin host_bin
+
+    (( ${#C2_WATCHLIST[@]} > 0 )) || return 0
+
+    dig_bin="$(trusted_bin dig 2>/dev/null || true)"
+    host_bin="$(trusted_bin getent 2>/dev/null || true)"
+
+    for entry in "${C2_WATCHLIST[@]}"; do
+
+        c2_entry_is_ip "$entry" && continue
+
+        # A pinned entry in /etc/hosts is stronger than a DNS
+        # answer: somebody put it there deliberately.
+        hostsfile_hit=""
+        if [[ -r /etc/hosts ]]; then
+            hostsfile_hit="$(grep -iE "[[:space:]]${entry//./\.}([[:space:]]|$)" /etc/hosts 2>/dev/null | head -3)"
+        fi
+
+        if [[ -n "$hostsfile_hit" ]]; then
+            found=$(( found + 1 ))
+            add_finding CRITICAL \
+                "Known C2 domain pinned in /etc/hosts" \
+                id="c2-hosts-pin:$entry" \
+                event=IOC_C2_DNS \
+                path="/etc/hosts" \
+                confidence=99 \
+                reasons="${entry} is on the command-and-control watchlist
+It has a fixed entry in /etc/hosts, which overrides DNS for every process on this host
+Nobody adds a C2 domain to /etc/hosts by accident" \
+                evidence="$(truncate_text "$(redact "$hostsfile_hit")" 300)" \
+                action="Preserve /etc/hosts before editing it. Find what wrote the entry and when: stat /etc/hosts. Treat the host as compromised."
+            continue
+        fi
+
+        # Resolution itself: report only that it resolves, and to
+        # what. Nothing connects to the result.
+        resolved=""
+        if [[ -n "$host_bin" ]]; then
+            resolved="$(run_timeout 8 "$host_bin" ahosts "$entry" 2>/dev/null | awk '{print $1}' | sort -u | head -4 | tr '\n' ' ')"
+        elif [[ -n "$dig_bin" ]]; then
+            resolved="$(run_timeout 8 "$dig_bin" +short "$entry" 2>/dev/null | head -4 | tr '\n' ' ')"
+        fi
+
+        [[ -n "$resolved" ]] || continue
+
+        found=$(( found + 1 ))
+        add_finding MEDIUM \
+            "Known C2 domain still resolves from this host" \
+            id="c2-resolves:$entry" \
+            event=IOC_C2_DNS \
+            confidence=60 \
+            reasons="${entry} is on the command-and-control watchlist and resolves to ${resolved}
+This does not mean the host contacted it - it means the route out is open
+An implant that beacons on a schedule shows no socket in between beacons" \
+            network="$entry -> $resolved" \
+            evidence="resolved via the system resolver, no connection was attempted" \
+            action="Block the domain and its addresses at the perimeter, then check the DNS and proxy logs for past queries from this host. Absence of a live socket is not absence of the implant."
+
+    done
+
+    (( found == 0 )) && add_pass "no watchlist domain is pinned in /etc/hosts or resolvable"
+}
+
+# ------------------------------------------------------------
 # 3. Preload based credential interception
 #
 # /etc/ld.so.preload injects a library into every dynamically
@@ -625,6 +760,12 @@ run_audit_ioc() {
 
     module_begin "ioc" "IOC Hunt"
 
+    if ioc_load_c2_watchlist; then
+        add_pass "C2 watchlist loaded (${#C2_WATCHLIST[@]} entries from ${ITM_C2_LIST})"
+    else
+        add_skip "no C2 watchlist at ${ITM_C2_LIST}"
+    fi
+
     if ioc_load_database; then
         add_pass "IOC database loaded (${#KNOWN_IOCS[@]} indicators)"
         ioc_check_known_paths
@@ -632,6 +773,7 @@ run_audit_ioc() {
         ioc_check_known_hashes
         ioc_check_known_strings
         ioc_check_c2_connections
+        ioc_check_c2_dns
     else
         add_skip "no IOC database at ${ITM_IOC_DIR}/known-iocs.conf - generic checks still run"
     fi

@@ -58,6 +58,7 @@ AUDIT_MODULES=(
     audit_cron.sh
     audit_command.sh
     audit_ioc.sh
+    audit_datadir.sh
     audit_sshd.sh
     audit_ssh_session.sh
     audit_nginx.sh
@@ -106,6 +107,7 @@ REQUIRED_FILES=(
     "$SCRIPT_DIR/bin/itm-security"
     "$SCRIPT_DIR/lib/itm-audit-common.sh"
     "$SCRIPT_DIR/config/audit.conf.example"
+    "$SCRIPT_DIR/config/known-c2.list.example"
     "$SCRIPT_DIR/systemd/itm-security-audit.service"
     "$SCRIPT_DIR/systemd/itm-security-audit.timer"
     "$SCRIPT_DIR/logrotate/itm-security"
@@ -570,7 +572,8 @@ else
         -o root \
         -g root \
         -m 0600 \
-        "$SCRIPT_DIR/config/audit.conf.example" \
+        "$SCRIPT_DIR/config/audit.conf.example"
+    "$SCRIPT_DIR/config/known-c2.list.example" \
         "$AUDIT_CONF"
 
     echo "[+] audit.conf created from example."
@@ -603,6 +606,48 @@ else
 
     echo "[+] trusted_networks.conf created."
 
+fi
+
+# ------------------------------------------------------------
+# C2 watchlist
+#
+# Merged like the IOC lists: entries added during an incident on
+# this host are never removed by an upgrade.
+# ------------------------------------------------------------
+
+C2_LIST="/etc/security-monitor/known-c2.list"
+
+if [[ -f "$C2_LIST" ]]; then
+
+    C2_ADDED=0
+    C2_TMP="$(mktemp)"
+
+    while IFS= read -r c2_line; do
+        c2_line="${c2_line%%#*}"
+        c2_line="${c2_line//[[:space:]]/}"
+        [[ -z "$c2_line" ]] && continue
+        grep -qxF -- "$c2_line" "$C2_LIST" 2>/dev/null && continue
+        printf '%s\n' "$c2_line" >> "$C2_TMP"
+        C2_ADDED=$(( C2_ADDED + 1 ))
+    done < "$SCRIPT_DIR/config/known-c2.list.example"
+
+    if (( C2_ADDED > 0 )); then
+        cp -a "$C2_LIST" "${C2_LIST}.bak-$(date +%Y%m%d-%H%M%S)"
+        {
+            printf '\n# --- merged by install.sh on %s ---\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            cat "$C2_TMP"
+        } >> "$C2_LIST"
+        echo "[+] C2 watchlist updated (+${C2_ADDED} new indicator(s))."
+    else
+        echo "[+] C2 watchlist already current."
+    fi
+
+    rm -f "$C2_TMP"
+
+else
+    install -o root -g root -m 0600 \
+        "$SCRIPT_DIR/config/known-c2.list.example" "$C2_LIST"
+    echo "[+] C2 watchlist installed."
 fi
 
 # ------------------------------------------------------------

@@ -63,7 +63,7 @@ source "$ITM_LIB_DIR/itm-audit-common.sh"
 # this host has a web application workload before touching the
 # filesystem. nginx runs before php/web/webshell because those
 # consume the document roots and FastCGI targets it discovers.
-ITM_ALL_MODULES="role health process network pam systemd cron command ioc sshd ssh_session nginx apache php web webshell gambling seo integrity fail2ban"
+ITM_ALL_MODULES="role health process network pam systemd cron command ioc datadir sshd ssh_session nginx apache php web webshell gambling seo integrity fail2ban"
 
 module_file() {
     case "$1" in
@@ -76,6 +76,7 @@ module_file() {
         cron)     printf '%s' "audit_cron.sh" ;;
         command)  printf '%s' "audit_command.sh" ;;
         ioc)      printf '%s' "audit_ioc.sh" ;;
+        datadir)  printf '%s' "audit_datadir.sh" ;;
         sshd)     printf '%s' "audit_sshd.sh" ;;
         ssh_session) printf '%s' "audit_ssh_session.sh" ;;
         nginx)    printf '%s' "audit_nginx.sh" ;;
@@ -117,6 +118,8 @@ Modules:
   command     wrapper binaries hiding processes, ports and files
   ioc         unpackaged binaries in system directories, known IOC
               paths/hashes/domains, ld.so.preload injection
+  datadir     world-writable data directories, and the ones that
+              hold raw database files
   sshd        effective sshd config: root login, password auth,
               MaxAuthTries, client alive (recommendations only)
   ssh_session SSH session inventory and maximum duration control
@@ -147,6 +150,11 @@ Incident response:
                  script per finding under /root/forensic/incident-<time>/.
                  Generating changes nothing. Each script preserves evidence
                  and only contains the threat when re-run with CONFIRM=yes.
+
+  triage         same as "remediate --interactive": generate the pack and then
+                 walk every finding, deciding one at a time whether it is
+                 legitimate. Each decision and its reason is written to
+                 DECISIONS.log so it can be read back months later.
 
 Web subcommands:
   web baseline   (re)build the source integrity baseline
@@ -523,6 +531,18 @@ run_audit() {
     # destroyed.
     if [[ "${ITM_REMEDIATE_MODE:-0}" == "1" ]]; then
         rem_generate "${REMEDIATE_MIN_SEVERITY:-HIGH}"
+
+        # Interactive triage runs only with a terminal: it asks
+        # questions, and a timer or a pipeline cannot answer them.
+        if [[ "${ITM_TRIAGE_MODE:-0}" == "1" && -n "$REM_INCIDENT_DIR" ]]; then
+            if [[ -t 0 && -x "$REM_INCIDENT_DIR/00-triage.sh" ]]; then
+                "$REM_INCIDENT_DIR/00-triage.sh"
+            elif [[ -x "$REM_INCIDENT_DIR/00-triage.sh" ]]; then
+                say ""
+                say "Interactive triage needs a terminal. Run it yourself:"
+                say "  sudo bash $REM_INCIDENT_DIR/00-triage.sh"
+            fi
+        fi
     fi
 
     if (( ITM_JSON_MODE )); then
@@ -597,6 +617,12 @@ Absence of this message is itself an alert." >/dev/null 2>&1 \
             ITM_REMEDIATE=1
             ITM_REMEDIATE_MODE=1
             ;;
+        triage)
+            # Generate the pack, then walk it interactively.
+            ITM_REMEDIATE=1
+            ITM_REMEDIATE_MODE=1
+            ITM_TRIAGE_MODE=1
+            ;;
         *)
             say_err "[ERROR] Unknown command: $command"
             say_err "Run 'itm-security help' for usage."
@@ -617,6 +643,9 @@ Absence of this message is itself an alert." >/dev/null 2>&1 \
                 shift || true
                 TELEGRAM_MIN_SEVERITY_OVERRIDE="${1:-HIGH}"
                 REMEDIATE_MIN_SEVERITY="${1:-HIGH}"
+                ;;
+            --interactive|-i)
+                ITM_TRIAGE_MODE=1
                 ;;
             --dry-run|--dryrun)
                 ITM_DRY_RUN=1

@@ -211,7 +211,7 @@ $why" \
 #   - the payload it called is usually still on disk
 #   - re-arming it is one character of editing
 #
-# Real incident on this estate (formppid, 2026-08):
+# Real incident on this estate (2026-08):
 #
 #   #auth optional pam_exec.so quiet expose_authtok \
 #        /usr/bin/x86_65-linux-gnu-op
