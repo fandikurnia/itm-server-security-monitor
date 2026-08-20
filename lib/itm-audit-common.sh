@@ -880,9 +880,28 @@ ip_in_cidr() {
     (( (ipint >> bits) == (netint >> bits) ))
 }
 
+# ------------------------------------------------------------
+# Normalise an address before any classification.
+#
+# A dual-stack socket reports an IPv4 peer as ::ffff:10.0.0.5,
+# and ss appends the interface to link-local addresses
+# (fe80::1%eth0). Without stripping both, an internal address
+# fails every private/trusted test and an ordinary internal
+# session is reported as coming from outside the estate.
+# ------------------------------------------------------------
+
+ip_normalize() {
+    local ip="$1"
+    ip="${ip#::ffff:}"
+    ip="${ip#[:][:]FFFF[:]}"
+    ip="${ip%\%*}"
+    printf '%s' "$ip"
+}
+
 ip_is_private() {
 
-    local ip="$1"
+    local ip
+    ip="$(ip_normalize "$1")"
 
     case "$ip" in
         10.*|127.*|169.254.*|192.168.*) return 0 ;;
@@ -900,7 +919,8 @@ ip_is_private() {
 
 ip_is_trusted() {
 
-    local ip="$1" net
+    local ip net
+    ip="$(ip_normalize "$1")"
 
     ip_is_private "$ip" && return 0
 
@@ -1950,4 +1970,9 @@ audit_exit_code() {
         HIGH)     return 2 ;;
         *)        return 0 ;;
     esac
+}
+
+# truncate_text, reading from stdin.
+truncate_text_stdin() {
+    truncate_text "$(cat)" "${1:-1200}"
 }

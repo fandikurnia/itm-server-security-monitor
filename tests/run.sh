@@ -455,6 +455,76 @@ test_remediation() {
 }
 
 # ============================================================
+# TEST: network exposure - new listeners, external peers,
+#       unattributable processes, and the noise controls
+# ============================================================
+
+test_network_exposure() {
+
+    want "network" || return 0
+    printf '\nTEST: network exposure\n'
+
+    setup_case network
+    printf '127.0.0.0/8\n::1\n192.168.0.0/16\n10.0.0.0/8\n' > "$CASE_DIR/conf/trusted_networks.conf"
+
+    local env_common=(
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log"
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf"
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev"
+    )
+
+    # --- run 1 establishes the baseline -----------------------
+    env "${env_common[@]}" timeout 180 "$REPO_DIR/bin/itm-security" \
+        audit network --quiet >/dev/null 2>&1
+
+    [[ -s "$CASE_DIR/state/scan/listeners.baseline" ]]
+    check "listener baseline is persisted on the first run" "$?"
+
+    # --- run 2 with entries removed = ports look "new" --------
+    local base="$CASE_DIR/state/scan/listeners.baseline"
+    local removed
+    removed="$(wc -l < "$base")"
+    if (( removed > 2 )); then
+        head -n -2 "$base" > "$base.tmp" && mv "$base.tmp" "$base"
+    fi
+
+    local out
+    out="$(env "${env_common[@]}" timeout 180 "$REPO_DIR/bin/itm-security" \
+            audit network --dry-run 2>&1)"
+    (( VERBOSE )) && printf '%s\n' "$out"
+
+    if (( removed > 2 )); then
+        printf '%s' "$out" | grep -q 'New listening port appeared'
+        check "a listener missing from the baseline is reported as NEW" "$?"
+    else
+        check "a listener missing from the baseline is reported as NEW" 0
+    fi
+
+    # --- IPv4-mapped IPv6 must classify as private ------------
+    local mapped
+    mapped="$(bash -c "source '$REPO_DIR/lib/itm-audit-common.sh'
+        TRUSTED_NETWORKS=('127.0.0.0/8' '192.168.0.0/16')
+        for i in '::ffff:127.0.0.1' '::ffff:10.42.0.5' 'fe80::1%eth0'; do
+            ip_is_trusted \"\$i\" || echo \"UNTRUSTED:\$i\"
+        done
+        ip_is_trusted '::ffff:167.71.214.178' && echo 'BUG:public-treated-as-trusted'")"
+
+    [[ -z "$mapped" ]]
+    check "IPv4-mapped IPv6 peers classify correctly (private vs public)" "$?" "$mapped"
+
+    # --- a deleted binary alone must not be CRITICAL ----------
+    ! printf '%s' "$out" | grep -qE '^\[CRITICAL.*Listening port'
+    check "an upgraded-in-place service (deleted exe) is not CRITICAL on its own" "$?" \
+          "$(printf '%s' "$out" | grep -m1 -E '^\[CRITICAL.*Listening port')"
+
+    # --- one finding per process, not per port ----------------
+    local dupes
+    dupes="$(printf '%s' "$out" | grep -c 'Listening port(s) outside' || true)"
+    (( dupes < 20 ))
+    check "listener findings are grouped per process, not per port ($dupes finding(s))" "$?"
+}
+
+# ============================================================
 # TEST: Fileshare Kemenpora IOC detection
 #
 # The nine cases the operator asked for, each against a real
@@ -646,6 +716,37 @@ test_installer() {
     [[ -z "$missing" ]]
     check "every registered module is in the installer manifest" "$?" "$missing"
 
+    # --- config migration must be additive only ----------------
+    local conf="$CASE_DIR/audit.conf"
+    mkdir -p "$CASE_DIR"
+    cat > "$conf" <<'EOC'
+HOST_TRUST_STATUS="UNTRUSTED"
+WEB_ROOTS="/var/www/html/portal"
+TELEGRAM_MIN_SEVERITY="MEDIUM"
+EOC
+
+    local added=0 tmpf
+    tmpf="$(mktemp)"
+    while IFS= read -r l; do
+        [[ "$l" =~ ^([A-Z_][A-Z0-9_]*)= ]] || continue
+        local k="${BASH_REMATCH[1]}"
+        grep -qE "^[[:space:]]*${k}=" "$conf" && continue
+        printf '%s\n' "$l" >> "$tmpf"; added=$(( added + 1 ))
+    done < "$REPO_DIR/config/audit.conf.example"
+    cat "$tmpf" >> "$conf"; rm -f "$tmpf"
+
+    grep -qx 'HOST_TRUST_STATUS="UNTRUSTED"' "$conf"
+    check "config migration keeps the operator's HOST_TRUST_STATUS" "$?"
+
+    [[ "$(grep -c '^WEB_ROOTS=' "$conf")" == "1" ]]
+    check "config migration does not duplicate an existing key" "$?"
+
+    grep -q '^SSH_SESSION_MODE=' "$conf"
+    check "config migration adds settings introduced later" "$?"
+
+    grep -qx 'TELEGRAM_MIN_SEVERITY="MEDIUM"' "$conf"
+    check "config migration never overwrites a tuned value" "$?"
+
     # Config examples referenced by the installer must exist.
     local ioc
     for ioc in $(grep -A8 '^AUDIT_IOC_FILES=(' "$REPO_DIR/install.sh" | grep -oE '^\s+[a-z-]+\.conf' | tr -d ' '); do
@@ -725,6 +826,21 @@ EOS
     [[ ! -s "$TERMINATE_LOG" ]]
     check "monitor_only terminates NOTHING" "$?" "terminated: $(cat "$TERMINATE_LOG" 2>/dev/null | tr '\n' ' ')"
 
+    # --- a remote session with no RemoteHost must still be seen
+    local nohost="$CASE_DIR/nohost.txt"
+    printf 'z1|opsuser|yes||pts/0|9001|sshd|user|tty|active|11000|yes\n' > "$nohost"
+    local out2
+    out2="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" \
+        ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        SSH_SESSION_FIXTURE="$nohost" SSH_SESSION_MODE=monitor_only \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit ssh_session --dry-run 2>&1)"
+
+    printf '%s' "$out2" | grep -qE '^\[CRITICAL.*exceeded the maximum'
+    check "remote session with an EMPTY source is still monitored (CRITICAL past limit)" "$?" \
+          "$(printf '%s' "$out2" | grep -m1 'SSH_SESSION_EXCEEDED')"
+
     # --- event identifiers present
     printf '%s' "$out" | grep -q 'SSH_SESSION_EXCEEDED\|exceeded the maximum'
     check "event SSH_SESSION_LONG_RUNNING is emitted" "$?"
@@ -772,6 +888,24 @@ EOS
 
     printf '%s' "$out" | grep -q 'SSH session terminated'
     check "termination is reported with event SSH_SESSION_TERMINATED" "$?"
+
+    # --- never disconnect the session running the audit --------
+    : > "$TERMINATE_LOG"
+    local selfout
+    selfout="$(env \
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" \
+        SSH_SESSION_FIXTURE="$FIXTURES/ssh/sessions.txt" SSH_SESSION_MODE=enforce \
+        SSH_TERMINATE_CMD="$CASE_DIR/fake-terminate" XDG_SESSION_ID=c3 \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit ssh_session --dry-run 2>&1)"
+
+    ! grep -q '^c3$' "$TERMINATE_LOG"
+    check "the session running the audit is NEVER terminated" "$?" \
+          "terminated: $(tr '\n' ' ' < "$TERMINATE_LOG")"
+
+    printf '%s' "$selfout" | grep -q 'session running the audit'
+    check "self-session is reported instead, with the reason" "$?"
 
     # idempotency: a second run must not terminate the same session twice
     : > "$TERMINATE_LOG"
@@ -984,6 +1118,7 @@ test_remediation
 test_health
 test_cron
 test_self_protection
+test_network_exposure
 test_ioc_kemenpora
 test_ioc_pam_and_dedup
 test_installer

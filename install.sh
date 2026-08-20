@@ -516,7 +516,53 @@ done
 
 if [[ -f "$AUDIT_CONF" ]]; then
 
-    echo "[+] Existing audit.conf preserved."
+    #
+    # Preserve every value the operator set, but append keys this
+    # version introduced and the file does not have yet.
+    #
+    # Without this, a feature added after the host was installed
+    # is invisible: it runs on built-in defaults that nobody can
+    # see or tune, and the operator has no way to know the knob
+    # exists. Values already present are never touched, never
+    # reordered, and never re-commented.
+    #
+    CONF_ADDED=0
+    CONF_TMP="$(mktemp)"
+
+    while IFS= read -r conf_line; do
+
+        # Only KEY="value" / KEY=value lines are candidates.
+        [[ "$conf_line" =~ ^([A-Z_][A-Z0-9_]*)= ]] || continue
+        conf_key="${BASH_REMATCH[1]}"
+
+        # Already configured on this host: leave it alone.
+        grep -qE "^[[:space:]]*${conf_key}=" "$AUDIT_CONF" && continue
+
+        printf '%s\n' "$conf_line" >> "$CONF_TMP"
+        CONF_ADDED=$(( CONF_ADDED + 1 ))
+
+    done < "$SCRIPT_DIR/config/audit.conf.example"
+
+    if (( CONF_ADDED > 0 )); then
+        cp -a "$AUDIT_CONF" "${AUDIT_CONF}.bak-$(date +%Y%m%d-%H%M%S)"
+        {
+            printf '\n\n'
+            printf '# ============================================================\n'
+            printf '# Added by install.sh on %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            printf '#\n'
+            printf '# Settings introduced by this version. These are the built-in\n'
+            printf '# defaults, written here so they are visible and tunable.\n'
+            printf '# Nothing above this line was changed.\n'
+            printf '# ============================================================\n\n'
+            cat "$CONF_TMP"
+        } >> "$AUDIT_CONF"
+        echo "[+] audit.conf updated (+${CONF_ADDED} new setting(s), existing values untouched)."
+        echo "    Previous version: ${AUDIT_CONF}.bak-*"
+    else
+        echo "[+] Existing audit.conf already current."
+    fi
+
+    rm -f "$CONF_TMP"
 
 else
 
@@ -1184,8 +1230,10 @@ fi
 IOC_FOUND="$(find "$AUDIT_IOC_DIR" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)"
 check_result "IOC lists:" "$IOC_FOUND / ${#AUDIT_IOC_FILES[@]}"
 
-HOST_ROLE_LINE="$(/usr/local/sbin/itm-security audit role --dry-run --quiet 2>/dev/null | grep -m1 'host role:' || true)"
-check_result "Host role:" "${HOST_ROLE_LINE#*host role: }"
+# --quiet suppresses exactly the line this greps for.
+HOST_ROLE_LINE="$(/usr/local/sbin/itm-security audit role --dry-run 2>/dev/null | grep -m1 'host role:' || true)"
+HOST_ROLE_LINE="${HOST_ROLE_LINE#*host role: }"
+check_result "Host role:" "${HOST_ROLE_LINE:-not determined}"
 
 check_result "Host trust status:" \
     "$(grep -E '^HOST_TRUST_STATUS=' "$AUDIT_CONF" 2>/dev/null | cut -d'"' -f2 || echo UNVERIFIED)"
@@ -1236,8 +1284,11 @@ done
 # --- timers that must be armed -----------------------------
 for tmr in itm-security-audit.timer itm-web-scan.timer itm-ssh-session.timer; do
     if systemctl is-active --quiet "$tmr" 2>/dev/null; then
-        validate "$tmr" "ACTIVE" \
-            "next: $(systemctl show "$tmr" -p NextElapseUSecRealtime --value 2>/dev/null | cut -c1-25)"
+        # A monotonic timer (OnUnitActiveSec) has no realtime
+        # next-elapse value; list-timers resolves both kinds.
+        TMR_NEXT="$(systemctl list-timers "$tmr" --no-legend --no-pager 2>/dev/null | awk '{print $1, $2, $3}')"
+        [[ -n "$TMR_NEXT" ]] || TMR_NEXT="$(systemctl show "$tmr" -p NextElapseUSecRealtime --value 2>/dev/null | cut -c1-25)"
+        validate "$tmr" "ACTIVE" "next: ${TMR_NEXT:-scheduled}"
     elif [[ "$INSTALL_AUDIT_TIMER" != "1" || "$INSTALL_WEB_MONITOR" != "1" ]]; then
         validate "$tmr" "WARN" "disabled by operator"
     else
@@ -1278,10 +1329,25 @@ else
 fi
 
 # --- JSON output must be parseable by a SIEM ----------------
-if /usr/local/sbin/itm-security audit role --json --dry-run 2>/dev/null | head -1 | grep -q '^\[' ; then
-    validate "JSON output" "OK" "valid array"
+#
+# Captured into a variable rather than piped into head: this
+# script runs under "set -o pipefail", and head closing the pipe
+# early makes the producer exit on SIGPIPE (141), which would
+# report a perfectly good JSON document as unverifiable.
+JSON_OUT="$(/usr/local/sbin/itm-security audit role --json --dry-run 2>/dev/null || true)"
+
+if [[ "${JSON_OUT:0:1}" == "[" ]] && [[ "$JSON_OUT" == *'"module":"role"'* ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+        if printf '%s' "$JSON_OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+            validate "JSON output" "OK" "valid, parsed"
+        else
+            validate "JSON output" "FAIL" "produced but does not parse"
+        fi
+    else
+        validate "JSON output" "OK" "valid array (structure checked)"
+    fi
 else
-    validate "JSON output" "WARN" "could not be verified"
+    validate "JSON output" "WARN" "no JSON produced"
 fi
 
 # --- evidence and state must be writable --------------------

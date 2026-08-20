@@ -214,6 +214,17 @@ ssh_session_privesc() {
 ssh_is_remote_ssh() {
     local remote="$1" remote_host="$2" service="$3" class="$4" state="${5:-}"
     [[ "$remote" == "yes" ]] || return 1
+    #
+    # RemoteHost is NOT required.
+    #
+    # logind sometimes marks a session Remote=yes while leaving
+    # RemoteHost empty. Requiring it made those sessions
+    # invisible: they were never counted, never aged, and never
+    # eligible for enforcement. A session whose source cannot be
+    # established is the one that deserves MORE attention, not
+    # less - so it is monitored, and the unknown source pushes it
+    # to CRITICAL once it passes the limit.
+    #
     # A session that is already closing or closed is not a
     # candidate for anything: acting on it either does nothing or
     # lands on a reused session id.
@@ -221,7 +232,6 @@ ssh_is_remote_ssh() {
         active|online|opening|"") ;;
         *) return 1 ;;
     esac
-    [[ -n "$remote_host" ]]   || return 1
     case "$service" in
         sshd|ssh) ;;
         *) return 1 ;;
@@ -328,6 +338,38 @@ ssh_hms() {
 # hit the wrong person.
 # ------------------------------------------------------------
 
+# The session this audit is running inside.
+#
+# Enforcement is normally triggered by the systemd timer, which
+# runs outside any login session. But an administrator will
+# eventually run "itm-security audit ssh_session" by hand from
+# their own SSH session - and if that session is over the limit,
+# the tool would disconnect the person operating it, mid-command,
+# with no way to see the result.
+#
+# A monitor that cuts off the operator investigating an incident
+# is worse than one that misses a session.
+ssh_own_session_id() {
+
+    local id=""
+
+    # Set by pam_systemd for interactive logins.
+    if [[ -n "${XDG_SESSION_ID:-}" ]]; then
+        printf '%s' "$XDG_SESSION_ID"
+        return 0
+    fi
+
+    # Fall back to the session scope in our own cgroup.
+    if [[ -r /proc/self/cgroup ]]; then
+        id="$(grep -oE 'session-[0-9]+\.scope' /proc/self/cgroup 2>/dev/null | head -1)"
+        id="${id#session-}"
+        id="${id%.scope}"
+        [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
+    fi
+
+    return 1
+}
+
 ssh_already_terminated() {
     local id="$1" file="$ITM_SCAN_STATE_DIR/$SSH_TERMINATED_STATE_KEY"
     [[ -r "$file" ]] || return 1
@@ -412,7 +454,12 @@ check_ssh_sessions() {
         [[ "$age" =~ ^[0-9]+$ ]] || age=0
 
         local known="yes"
-        ssh_source_is_known "$remote_host" || known="no"
+        if [[ -z "$remote_host" ]]; then
+            remote_host="unknown"
+            known="no"
+        else
+            ssh_source_is_known "$remote_host" || known="no"
+        fi
 
         local severity
         severity="$(ssh_severity_for "$age" "$known")"
@@ -492,6 +539,27 @@ $( [[ -n "$exempt_reason" ]] && printf 'exemption: %s' "$exempt_reason" )" \
         fi
 
         # ---- enforce
+        local own_session
+        own_session="$(ssh_own_session_id || true)"
+
+        if [[ -n "$own_session" && "$own_session" == "$id" ]]; then
+            add_finding "$severity" \
+                "SSH session exceeded the maximum duration (this is the session running the audit)" \
+                id="ssh-session-self:$id:$user" \
+                event=SSH_SESSION_LONG_RUNNING \
+                confidence=99 \
+                reasons="$reasons
+NOT terminated: this is the session the audit itself is running in
+Disconnecting the operator in the middle of an investigation is never the right call
+The scheduled timer runs outside any login session and is unaffected by this rule" \
+                process="session=$id user=$user leader=$leader tty=${tty:-none} privilege_escalation=$privesc" \
+                network="source=$remote_host known=$known" \
+                evidence="age=$(ssh_hms "$age") limit=$(ssh_hms "$SSH_MAX_SESSION_SECONDS") mode=$SSH_SESSION_MODE
+own session id=$own_session" \
+                action="Reconnect and let the timer handle it, or close this session yourself: exit. To terminate it explicitly: loginctl terminate-session $id"
+            continue
+        fi
+
         if ssh_already_terminated "$id"; then
             audit_log INFO "session $id already terminated in an earlier run - not repeating"
             continue
