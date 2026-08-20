@@ -1322,6 +1322,21 @@ test_notify_secret() {
 
     grep -q 'rm -f "$NOTIFY_BODY"' "$REPO_DIR/bin/security-notify"
     check "the temporary body file is always removed" "$?"
+
+    # --- the uninstaller sends one last message too -----------
+    #
+    # It is the one script guaranteed to run on a host somebody
+    # is currently taking apart, which is the worst moment to
+    # print the bot token into ps output.
+    ! grep -E '^\s*curl' "$REPO_DIR/uninstall.sh" | grep -q 'BOT_TOKEN'
+    check "uninstall.sh keeps the token off the command line" "$?" \
+          "$(grep -E '^\s*curl' "$REPO_DIR/uninstall.sh")"
+
+    ! grep -q 'sendMessage" \\' "$REPO_DIR/uninstall.sh"
+    check "uninstall.sh no longer passes the URL as an argument" "$?"
+
+    grep -q 'rm -f "$UNINSTALL_BODY"' "$REPO_DIR/uninstall.sh"
+    check "uninstall.sh removes its temporary body file" "$?"
 }
 
 # ------------------------------------------------------------
