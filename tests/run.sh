@@ -1222,6 +1222,50 @@ test_notify_secret() {
           "$(grep -E '^curl' "$REPO_DIR/bin/security-notify")"
 }
 
+test_pam_remediation_edit() {
+
+    want "pam-edit" || return 0
+    printf '\nTEST: PAM remediation edits the right line\n'
+
+    setup_case pam-edit
+
+    # The two states a pam_exec hook can be in. Getting these
+    # wrong means either doing nothing (dormant line untouched)
+    # or breaking authentication (deleting a live line).
+    printf 'auth\trequired\tpam_env.so\n#auth optional pam_exec.so quiet expose_authtok /usr/bin/gone\nauth\tsufficient\tpam_unix.so\n' \
+        > "$CASE_DIR/dormant"
+    printf 'auth\trequired\tpam_env.so\nauth optional pam_exec.so expose_authtok /usr/bin/evil\nauth\tsufficient\tpam_unix.so\n' \
+        > "$CASE_DIR/active"
+
+    local f
+    for f in dormant active; do
+        if grep -qE "^[^#]*pam_exec\.so" -- "$CASE_DIR/$f"; then
+            sed -i "s|^\(  *\)\{0,1\}\([^#].*pam_exec\.so.*\)\$|# ITM-DISABLED \2|" -- "$CASE_DIR/$f"
+        else
+            sed -i "/^[[:space:]]*#.*pam_exec\.so/d" -- "$CASE_DIR/$f"
+        fi
+    done
+
+    ! grep -q 'pam_exec' "$CASE_DIR/dormant"
+    check "a dormant (commented) pam_exec line is removed" "$?"
+
+    grep -q 'ITM-DISABLED' "$CASE_DIR/active"
+    check "an active pam_exec line is commented out, not deleted" "$?"
+
+    grep -q 'pam_unix.so' "$CASE_DIR/dormant" && grep -q 'pam_unix.so' "$CASE_DIR/active"
+    check "the rest of the PAM stack is left intact in both cases" "$?"
+
+    grep -q 'pam_env.so' "$CASE_DIR/active"
+    check "no other module line is disturbed" "$?"
+
+    # the generator must contain both branches
+    grep -q 'removing DORMANT' "$REPO_DIR/lib/itm-remediate.sh"
+    check "the generated script handles the dormant case at all" "$?"
+
+    grep -q 'CONSOLE_ACCESS' "$REPO_DIR/lib/itm-remediate.sh"
+    check "PAM edits still require console access to be confirmed" "$?"
+}
+
 test_health() {
 
     want "health" || return 0
@@ -1345,6 +1389,7 @@ test_non_web_host
 test_safety_invariants
 test_remediation
 test_triage
+test_pam_remediation_edit
 test_systemd_override
 test_systemd_reasons
 test_notify_secret
