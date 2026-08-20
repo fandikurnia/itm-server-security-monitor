@@ -1220,6 +1220,34 @@ test_notify_secret() {
     ! grep -E '^curl' "$REPO_DIR/bin/security-notify" | grep -q 'BOT_TOKEN'
     check "the token is not on the curl command line" "$?" \
           "$(grep -E '^curl' "$REPO_DIR/bin/security-notify")"
+
+    # --- and the message must still arrive whole -------------
+    #
+    # A curl config file is parsed one line at a time, so a value
+    # written inline stops at the first newline. Hiding the token
+    # that way once truncated every alert to its first line: a
+    # dozen different findings all arrived as "SECURITY ALERT"
+    # and nothing else, which reads as a flood of empty alarms.
+    #
+    # Checking the script text is not enough - send a multi-line
+    # body through the real config form and read back what the
+    # server actually received.
+    grep -q 'data-urlencode = "text@' "$REPO_DIR/bin/security-notify"
+    check "the body is passed by file reference, not inline" "$?"
+
+    ! grep -q 'text=${TEXT}' "$REPO_DIR/bin/security-notify"
+    check "the truncating inline form is gone" "$?"
+
+    setup_case notify-body
+    local got
+    got="$(python3 "$FIXTURES/notify-probe.py" "$CASE_DIR" 2>/dev/null)"
+
+    [[ "${got:-0}" -ge 4 ]]
+    check "a multi-line alert body survives transport" "$?" \
+          "lines received: ${got:-none}"
+
+    grep -q 'rm -f "$NOTIFY_BODY"' "$REPO_DIR/bin/security-notify"
+    check "the temporary body file is always removed" "$?"
 }
 
 # ------------------------------------------------------------
@@ -1408,6 +1436,72 @@ test_pam_generated_multidistro() {
 
     printf '%s' "$out" | grep -A3 'expose_authtok' | grep -q 'ACTIVE pam_exec hook runs'
     check "an active pam_exec finding explains itself in reasons" "$?"
+}
+
+# ------------------------------------------------------------
+# The stderr.<letter> family.
+#
+# A binary called stderr.q in /usr/bin reads as shell noise in a
+# listing. The suffix rotates per drop - .q .d .w .l have been
+# recovered from this estate - so the list carries a glob for the
+# letters nobody has seen yet.
+#
+# The glob is deliberately ONE character: the search directories
+# include /tmp and /dev/shm, where stderr.log is ordinary.
+# ------------------------------------------------------------
+test_ioc_stderr_family() {
+
+    want "ioc-stderr" || return 0
+    printf '\nTEST: stderr.<letter> implant family\n'
+
+    local conf="$REPO_DIR/config/known-iocs.conf.example" v
+    for v in q d w l; do
+        grep -qxF "path:/usr/bin/stderr.$v" "$conf"
+        check "stderr.$v is listed as a path indicator" "$?"
+    done
+
+    grep -qxF 'filename:stderr.?' "$conf"
+    check "the single-character glob ships" "$?"
+
+    ! grep -qxF 'filename:stderr.*' "$conf"
+    check "the greedy glob does NOT ship (stderr.log is ordinary)" "$?"
+
+    setup_case ioc-stderr
+    mkdir -p "$CASE_DIR/bin"
+    local f
+    for f in stderr.q stderr.d stderr.w stderr.l stderr.x stderr.log ls; do
+        printf '#!/bin/sh\n' > "$CASE_DIR/bin/$f"
+        chmod 755 "$CASE_DIR/bin/$f"
+    done
+
+    local out
+    out="$(
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_ioc.sh"
+        IOC_FILENAME_SEARCH_DIRS="$CASE_DIR/bin"
+        KNOWN_IOCS=("filename:stderr.?")
+        module_begin ioc 'IOC'
+        ioc_check_ioc_filenames
+        audit_runtime_cleanup
+    2>&1 )"
+
+    for f in stderr.q stderr.d stderr.w stderr.l; do
+        printf '%s' "$out" | grep -q "/$f"
+        check "$f is caught by the glob" "$?"
+    done
+
+    # an unseen letter must be caught without touching the list
+    printf '%s' "$out" | grep -q '/stderr.x'
+    check "an unrecorded letter is caught too" "$?"
+
+    ! printf '%s' "$out" | grep -q 'stderr.log'
+    check "stderr.log is NOT reported" "$?"
+
+    ! printf '%s' "$out" | grep -qE '/ls$|/ls '
+    check "an ordinary binary is not swept up" "$?"
 }
 
 test_ioc_toolchain_variants() {
@@ -1734,6 +1828,7 @@ test_pam_remediation_edit
 test_pam_remediation_script
 test_ioc_masked_unit
 test_ioc_toolchain_variants
+test_ioc_stderr_family
 test_pam_generated_multidistro
 test_apache_multidistro
 test_systemd_override

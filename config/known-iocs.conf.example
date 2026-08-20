@@ -119,9 +119,20 @@ string:/sudo/socket.php
 # ============================================================
 
 # --- payload binaries ---
+#
+# The stderr.<letter> family is a naming technique, not four
+# separate payloads. A binary called "stderr.q" in /usr/bin reads
+# as shell noise in any listing or log line, and the suffix is
+# rotated per host or per drop: .q .d .w .l have all been
+# recovered, and there is no reason the next one stops there.
+#
+# The glob entry below covers the letters nobody has seen yet.
 path:/usr/bin/defaults
 path:/usr/bin/security
 path:/usr/bin/stderr.q
+path:/usr/bin/stderr.d
+path:/usr/bin/stderr.w
+path:/usr/bin/stderr.l
 path:/usr/bin/kemenpora
 
 # --- forensic command wrappers (also covered by the command module) ---
@@ -138,8 +149,17 @@ path:/etc/systemd/system/server-security.service
 path:/etc/systemd/system/multi-user.target.wants/defaults.service
 
 # --- names hunted in the bounded search directories ---
+#
+# These are passed to find -name, so shell globs work.
+#
+# stderr.? matches ONE character after the dot, deliberately.
+# stderr.* would also match stderr.log, and the search directories
+# include /tmp, /var/tmp and /dev/shm where a program writing its
+# own error log is ordinary. One character is what the implant
+# uses and what nothing legitimate is called.
 filename:x86_65-linux-gnu-op
 filename:x86_64-linux-gnu-op
+filename:stderr.?
 filename:kiann.php
 
 # --- payload hashes (a renamed copy is still detected) ---
