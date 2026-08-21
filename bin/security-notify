@@ -51,7 +51,9 @@ Private IP : ${PRIVATE_IP}
 Public IP  : ${PUBLIC_IP}
 Time       : ${NOW}
 
-${MESSAGE}"
+${MESSAGE}
+
+— Created by ITM Team"
 
 #
 # The token is passed to curl through a config file on stdin,
