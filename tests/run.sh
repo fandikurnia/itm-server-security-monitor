@@ -1337,6 +1337,21 @@ test_notify_secret() {
     check "a multi-line alert body survives transport" "$?" \
           "lines received: ${got:-none}"
 
+    # --- attribution footer rides on the real message ---------
+    #
+    # Run the actual script, not a copy of its logic: the footer
+    # must survive TEXT construction and the file-reference curl
+    # transport together, in the order the real script applies
+    # them.
+    local delivered
+    delivered="$(python3 "$FIXTURES/notify-attribution-probe.py" "$REPO_DIR" "$CASE_DIR" 2>/dev/null)"
+
+    printf '%s' "$delivered" | grep -qF -- '— Created by ITM Team'
+    check "the ITM Team attribution footer is delivered" "$?" "$delivered"
+
+    printf '%s' "$delivered" | grep -qF -- 'dormant pam_exec hook'
+    check "the finding text still precedes the footer" "$?"
+
     grep -q 'rm -f "$NOTIFY_BODY"' "$REPO_DIR/bin/security-notify"
     check "the temporary body file is always removed" "$?"
 
