@@ -469,11 +469,38 @@ run_audit() {
     # A signal handler that only cleans up would let the script
     # carry on with its temporary directory removed. Interrupt
     # means stop.
-    trap audit_runtime_cleanup EXIT
+    trap 'audit_abort_report; audit_runtime_cleanup' EXIT
     trap 'audit_runtime_cleanup; say_err "[WARN] Audit interrupted - partial results discarded."; exit 130' INT
     trap 'audit_runtime_cleanup; say_err "[WARN] Audit terminated - partial results discarded."; exit 143' TERM
 
     audit_log INFO "audit start run_id=$ITM_RUN_ID modules=${modules[*]} version=$ITM_AUDIT_VERSION"
+
+    # The module currently executing. If the process dies inside
+    # one - a set -u abort is fatal to the whole shell - the EXIT
+    # trap uses this to say which module killed the run.
+    #
+    # Without it the operator sees a bare shell error and an
+    # audit that produced no summary, no JSON and no alerts, with
+    # nothing tying the two together. On a host that may be
+    # compromised, an audit that stops silently is indistinguish-
+    # able from an audit that found nothing.
+    ITM_RUNNING_MODULE=""
+
+    audit_abort_report() {
+        local rc=$?
+        (( rc == 0 )) && return 0
+        [[ -n "$ITM_RUNNING_MODULE" ]] || return 0
+
+        say_err ""
+        say_err "[ERROR] AUDIT ABORTED inside module '$ITM_RUNNING_MODULE' (exit $rc)."
+        say_err "        This run is INCOMPLETE. Modules after it never ran, and"
+        say_err "        no summary, JSON or Telegram alert was produced."
+        say_err "        Do NOT read this as a clean result."
+        say_err ""
+        say_err "        Reproduce just that module:"
+        say_err "          itm-security audit $ITM_RUNNING_MODULE"
+        say_err ""
+    }
 
     if (( ITM_QUIET == 0 )); then
         say ""
@@ -498,7 +525,37 @@ run_audit() {
             continue
         fi
 
+        # One broken module must not take the whole audit with it.
+        #
+        # Under "set -u" an unset variable aborts the entire
+        # script, not just the function. A single bad expression
+        # in the first module therefore produced a run with no
+        # summary, no JSON, no Telegram alerts and no findings at
+        # all - the audit looked like it had never run, on a host
+        # that may be compromised. Silence is the worst possible
+        # failure mode for a security tool.
+        #
+        # Record which module is running, so that if it kills the
+        # process the EXIT trap can name it.
+        #
+        # A module cannot be isolated cheaply here. Under set -u
+        # an unbound variable is fatal to the whole shell, and
+        # "|| handler" does not catch it. Running the module in a
+        # subshell would catch it, but findings accumulate in
+        # shell variables (SEV_COUNT, TG_SEV, REM_SEV) that a
+        # subshell discards - every finding from that module
+        # would vanish from the summary and the alerts. Relaxing
+        # set -u is worse still: the unbound variable becomes an
+        # empty string and the check returns a WRONG answer
+        # instead of no answer, silently.
+        #
+        # Proper per-module isolation needs findings to be
+        # aggregated through files rather than shell state. Until
+        # then the run still dies, but it no longer dies without
+        # saying what killed it.
+        ITM_RUNNING_MODULE="$m"
         "run_audit_$m"
+        ITM_RUNNING_MODULE=""
     done
 
     if [[ "${ITM_HEALTH_MODE:-0}" == "1" ]]; then

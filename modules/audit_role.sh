@@ -326,7 +326,17 @@ role_detect_node() {
     # Listening alone is not enough: it has to be a managed
     # service, and either fronted by the web server or serving
     # HTTP directly.
-    if (( service_managed && (upstream || ROLE_WEB_SERVER != "none") )); then
+    #
+    # ROLE_WEB_SERVER holds a string ("nginx", "apache", "none"),
+    # so its comparison has to happen in [[ ]], not inside this
+    # (( )) arithmetic block: bash arithmetic re-evaluates a
+    # variable's STRING VALUE as another variable name, so
+    # ROLE_WEB_SERVER="nginx" made the expression dereference a
+    # variable literally called nginx - unset, and set -u turned
+    # that into a hard crash. It only ever fired on a host with a
+    # real, service-managed Node listener (service_managed=1),
+    # which is why it went unnoticed until one showed up.
+    if (( service_managed )) && { (( upstream )) || [[ "$ROLE_WEB_SERVER" != "none" ]]; }; then
         ROLE_NODE_APPLICATION=1
     elif (( listening && service_managed == 0 )); then
         role_note "Node web workload: NOT DETECTED (only user-session or containerised listeners)"
