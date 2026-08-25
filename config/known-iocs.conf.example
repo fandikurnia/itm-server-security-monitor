@@ -210,3 +210,53 @@ domain:jdih-kemenpora-plw72286ru.edgeone.app
 
 string:/sz/socket.php
 string:/sudo/socket.php
+
+
+# ============================================================
+# INCIDENT: Zimbra cryptojacking via pre-auth SNMP injection
+#
+# A Zimbra mail server was compromised and used for mining. The
+# whole monitoring stack was running and none of it fired: a
+# commercial EDR missed a miner at >99% CPU for over 40 minutes
+# because the payload was not in its signature database.
+#
+# Entry was pre-authentication command injection in the Zimbra
+# SNMP component on UDP/161, fixed in release 10.1.20.
+#
+# Four files were dropped in /var/tmp:
+#
+#   javab    the miner, an ELF binary
+#   idle     watchdog that re-downloaded the miner
+#   .rguard  killed any process whose command line matched
+#            */tmp/* every 0.1s, to eliminate rival miners
+#   .khp     dropper and persistence loader
+#
+# .rguard explains the outage. It matched the substring /tmp/
+# anywhere in a command line, and Zimbra's MySQL socket path
+# contains /tmp/ - so it killed the mail server's database ten
+# times a second. The visible symptom was "mail is down"; the
+# cause was one miner fighting another.
+#
+# The names below are recorded for cross-estate matching, but
+# they are NOT the defence. The cryptominer module detects this
+# class by BEHAVIOUR - sustained CPU, execution from volatile
+# directories, kill loops, pool egress - because the next
+# variant will not reuse these names.
+# ============================================================
+
+# --- payload names, hunted in the bounded search directories ---
+filename:javab
+filename:.rguard
+filename:.khp
+
+# --- command and control ---
+ip:45.74.7.226
+ip:45.74.7.234
+ip:185.119.90.206
+ip:87.229.64.49
+
+domain:kworker.eth.limo
+domain:kworker.eth.link
+
+# The "kworker" naming imitates a kernel worker thread, so the
+# domain reads as system noise in a DNS or proxy log.

@@ -1456,6 +1456,208 @@ test_notify_secret() {
 # now names the module and states plainly that the result must
 # not be read as clean.
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# Cryptojacking detection, built after a Zimbra mail server was
+# mined for 40+ minutes at >99% CPU while a commercial EDR and
+# this whole monitoring stack were running and silent.
+#
+# The lesson driving these checks: a signature cannot match a
+# payload nobody has seen. Behaviour can. A miner has to burn
+# CPU, has to be dropped somewhere, and has to reach a pool.
+#
+# Every simulation here uses harmless stand-ins - /bin/true
+# copies and no-op shell loops - never real malware, and every
+# one is cleaned up.
+# ------------------------------------------------------------
+test_cryptominer() {
+
+    want "cryptominer" || return 0
+    printf '\nTEST: cryptojacking and Zimbra checks\n'
+
+    setup_case cryptominer
+
+    # --- payload artefacts in a volatile directory ------------
+    #
+    # Stand-ins named after the real incident artefacts. These
+    # are copies of /bin/true and a one-line shell script.
+    local vol="$CASE_DIR/volatile"
+    mkdir -p "$vol"
+    cp /bin/true "$vol/javab"          # miner: visible ELF
+    cp /bin/true "$vol/.rguard"        # rival killer: hidden ELF
+    printf '#!/bin/sh\nexit 0\n' > "$vol/.khp"   # dropper: hidden script
+    chmod 755 "$vol/javab" "$vol/.rguard" "$vol/.khp"
+    printf 'not executable\n' > "$vol/readme.txt"
+
+    local out
+    out="$(
+        CRYPTO_VOLATILE_DIRS="$vol"
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_role.sh"
+        source "$REPO_DIR/modules/audit_cryptominer.sh"
+        module_begin cryptominer 'Cryptojacking'
+        check_volatile_payloads
+        audit_runtime_cleanup
+    2>&1 )"
+
+    printf '%s' "$out" | grep -q 'javab'
+    check "a dropped ELF in a volatile directory is reported" "$?"
+
+    assert_severity "$out" ".rguard" CRITICAL ""
+    check "a HIDDEN dropped ELF is CRITICAL" "$?"
+
+    assert_severity "$out" ".khp" CRITICAL ""
+    check "a hidden dropper script is CRITICAL" "$?"
+
+    ! printf '%s' "$out" | grep -q 'readme.txt'
+    check "a plain text file is not reported" "$?"
+
+    # --- the narrow exclusion list ---------------------------
+    #
+    # Chromium unpacks a sandbox helper into /tmp on every start.
+    # Reporting it daily is how an operator learns to ignore the
+    # channel.
+    local excl="$CASE_DIR/excl"
+    mkdir -p "$excl"
+    cp /bin/true "$excl/.org.chromium.Chromium.AbCdEf"
+    chmod 755 "$excl/.org.chromium.Chromium.AbCdEf"
+
+    out="$(
+        CRYPTO_VOLATILE_DIRS="$excl"
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_role.sh"
+        source "$REPO_DIR/modules/audit_cryptominer.sh"
+        module_begin cryptominer 'Cryptojacking'
+        check_volatile_payloads
+        audit_runtime_cleanup
+    2>&1 )"
+
+    ! printf '%s' "$out" | grep -q 'chromium'
+    check "a documented benign temp path is excluded" "$?"
+
+    # --- CPU accounting --------------------------------------
+    #
+    # Read from /proc rather than ps, because ps can be replaced
+    # by a wrapper - which happened in an earlier incident here.
+    local busy cpu elapsed
+    bash -c 'while :; do :; done' & busy=$!
+    sleep 3
+
+    read -r cpu elapsed <<< "$(
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/modules/audit_cryptominer.sh"
+        crypto_cpu_percent "$busy"
+    2>/dev/null )"
+
+    kill -9 "$busy" 2>/dev/null
+    wait "$busy" 2>/dev/null
+
+    [[ "${cpu:-0}" -ge 90 ]]
+    check "a busy process is measured at >=90% CPU" "$?" "measured: ${cpu:-none}%"
+
+    ! kill -0 "$busy" 2>/dev/null
+    check "the CPU simulation process is cleaned up" "$?"
+
+    # --- the rival killer ------------------------------------
+    #
+    # The distinguishing feature is the TIGHT loop. .rguard ran
+    # every 0.1s; an hourly /tmp cleanup script matches every
+    # other condition and must not be reported. An earlier,
+    # looser version of this check flagged the very shell that
+    # was testing it.
+    #
+    # ':' is a shell no-op, so the command line has the right
+    # shape while nothing is actually killed. Running a real
+    # "pkill -f /tmp/..." here would match the test harness's own
+    # command line and kill it - which is exactly the substring
+    # behaviour that took Zimbra's MySQL down.
+    crypto_killer_count() {
+        source "$REPO_DIR/lib/itm-audit-common.sh"
+        source "$REPO_DIR/lib/itm-web-common.sh"
+        audit_load_config; audit_detect_os; audit_detect_host
+        ITM_DRY_RUN=1; audit_runtime_init
+        source "$REPO_DIR/modules/audit_role.sh"
+        source "$REPO_DIR/modules/audit_cryptominer.sh"
+        module_begin cryptominer 'Cryptojacking'
+        check_process_killers
+        audit_runtime_cleanup
+    }
+
+    local tight loose n
+    bash -c 'while :; do sleep 0.1; : pkill -f /tmp/dummy ; done' & tight=$!
+    sleep 1
+    n="$( crypto_killer_count 2>&1 | grep -cE '^\[CRITICAL' )"
+    kill -9 "$tight" 2>/dev/null; wait "$tight" 2>/dev/null
+
+    (( n >= 1 ))
+    check "a sub-second kill loop is reported CRITICAL" "$?" "found: $n"
+
+    bash -c 'while :; do sleep 3600; : pkill -f /tmp/stale ; done' & loose=$!
+    sleep 1
+    n="$( crypto_killer_count 2>&1 | grep -cE '^\[CRITICAL' )"
+    kill -9 "$loose" 2>/dev/null; wait "$loose" 2>/dev/null
+
+    (( n == 0 ))
+    check "an hourly maintenance loop is NOT reported" "$?" "found: $n"
+
+    ! kill -0 "$tight" 2>/dev/null && ! kill -0 "$loose" 2>/dev/null
+    check "the kill-loop simulations are cleaned up" "$?"
+
+    # --- Zimbra version comparison ---------------------------
+    local v
+    v="$(
+        source "$REPO_DIR/modules/audit_cryptominer.sh"
+        crypto_version_lt "10.1.16" "10.1.20" && echo LOWER
+        crypto_version_lt "10.1.20" "10.1.20" || echo NOT_LOWER_EQUAL
+        crypto_version_lt "10.1.21" "10.1.20" || echo NOT_LOWER_NEWER
+        crypto_version_lt "9.0.0"   "10.1.20" && echo LOWER_MAJOR
+    2>/dev/null )"
+
+    printf '%s' "$v" | grep -q LOWER
+    check "10.1.16 is recognised as vulnerable" "$?"
+
+    printf '%s' "$v" | grep -q NOT_LOWER_EQUAL
+    check "10.1.20 itself is not vulnerable" "$?"
+
+    printf '%s' "$v" | grep -q NOT_LOWER_NEWER
+    check "10.1.21 is not vulnerable" "$?"
+
+    printf '%s' "$v" | grep -q LOWER_MAJOR
+    check "a lower major version compares correctly" "$?"
+
+    # --- the module never acts -------------------------------
+    #
+    # Match a destructive verb only where it would EXECUTE: at
+    # the start of a line or right after a shell separator.
+    #
+    # A naive word match fails here, and failing this way is
+    # worse than not testing at all: it flags the words "Do NOT
+    # kill it yet" inside an action string, and the case pattern
+    # that recognises the rival killer. Both are the module doing
+    # its job. A test that cries wolf on its own correct code
+    # teaches everyone to ignore it.
+    local acts
+    acts="$(grep -nE '(^|;|&&|\|\||\bthen\b|\bdo\b)[[:space:]]*(kill|pkill|killall|rm|mv|chattr|systemctl)[[:space:]]' \
+        "$REPO_DIR/modules/audit_cryptominer.sh" \
+        | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+
+    [[ -z "$acts" ]]
+    check "the module never kills, deletes or stops anything" "$?" "$acts"
+
+    # --- incident IOCs ship ----------------------------------
+    local conf="$REPO_DIR/config/known-iocs.conf.example" ioc
+    for ioc in 'filename:javab' 'filename:.rguard' 'filename:.khp' \
+               'ip:45.74.7.226' 'domain:kworker.eth.limo'; do
+        grep -qxF "$ioc" "$conf"
+        check "IOC present: $ioc" "$?"
+    done
+}
+
 test_audit_abort_is_reported() {
 
     want "abort-report" || return 0
@@ -2103,6 +2305,7 @@ test_ioc_masked_unit
 test_ioc_toolchain_variants
 test_ioc_stderr_family
 test_pam_generated_multidistro
+test_cryptominer
 test_audit_abort_is_reported
 test_role_string_in_arithmetic
 test_apache_multidistro

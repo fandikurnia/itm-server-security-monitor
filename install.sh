@@ -87,6 +87,7 @@ AUDIT_MODULES=(
     audit_cron.sh
     audit_command.sh
     audit_ioc.sh
+    audit_cryptominer.sh
     audit_datadir.sh
     audit_sshd.sh
     audit_ssh_session.sh

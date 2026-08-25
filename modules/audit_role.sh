@@ -51,6 +51,8 @@ ROLE_REVERSE_PROXY_ONLY=0
 ROLE_DATABASE=0
 ROLE_PROXMOX=0
 ROLE_MAIL=0
+ROLE_ZIMBRA=0
+ROLE_ZIMBRA_VERSION=""
 ROLE_DNS=0
 ROLE_CONTAINER_HOST=0
 ROLE_HYPERVISOR=0
@@ -367,6 +369,31 @@ role_detect_other() {
         fi
     done
 
+    # Zimbra is a mail server, but it does not look like one to
+    # the checks above: it ships its own bundled postfix, mariadb,
+    # jetty and OpenLDAP under /opt/zimbra and drives them through
+    # zmcontrol rather than through separate systemd units. A host
+    # running Zimbra therefore reported "no mail service" and the
+    # Zimbra specific checks never ran.
+    #
+    # Detected by the installation tree and its service account,
+    # not by a unit name, because the unit is named differently
+    # across Zimbra and Carbonio releases.
+    if [[ -d /opt/zimbra ]] || id zimbra >/dev/null 2>&1; then
+        ROLE_MAIL=1
+        ROLE_ZIMBRA=1
+        role_note "Zimbra collaboration suite detected (/opt/zimbra)"
+
+        if [[ -x /opt/zimbra/bin/zmcontrol ]]; then
+            ROLE_ZIMBRA_VERSION="$(
+                run_timeout "$CMD_TIMEOUT" /opt/zimbra/bin/zmcontrol -v 2>/dev/null \
+                | head -1 | tr -d '\r'
+            )"
+            [[ -n "$ROLE_ZIMBRA_VERSION" ]] \
+                && role_note "Zimbra version: $ROLE_ZIMBRA_VERSION"
+        fi
+    fi
+
     for svc in named bind9 unbound pdns dnsmasq; do
         if role_service_active "$svc"; then
             ROLE_DNS=1
@@ -498,6 +525,8 @@ role_cache_save() {
         printf 'ROLE_DATABASE=%s\n'           "$ROLE_DATABASE"
         printf 'ROLE_PROXMOX=%s\n'            "$ROLE_PROXMOX"
         printf 'ROLE_MAIL=%s\n'               "$ROLE_MAIL"
+        printf 'ROLE_ZIMBRA=%s\n'             "$ROLE_ZIMBRA"
+        printf 'ROLE_ZIMBRA_VERSION="%s"\n'   "$ROLE_ZIMBRA_VERSION"
         printf 'ROLE_DNS=%s\n'                "$ROLE_DNS"
         printf 'ROLE_CONTAINER_HOST=%s\n'     "$ROLE_CONTAINER_HOST"
         printf 'ROLE_HYPERVISOR=%s\n'         "$ROLE_HYPERVISOR"
@@ -567,6 +596,7 @@ role_is() {
         database)        (( ROLE_DATABASE )) ;;
         proxmox)         (( ROLE_PROXMOX )) ;;
         mail)            (( ROLE_MAIL )) ;;
+        zimbra)          (( ROLE_ZIMBRA )) ;;
         dns)             (( ROLE_DNS )) ;;
         container_host)  (( ROLE_CONTAINER_HOST )) ;;
         hypervisor)      (( ROLE_HYPERVISOR )) ;;
@@ -611,6 +641,7 @@ role_summary_line() {
     (( ROLE_NODE_APPLICATION )) && parts+=("node")
     (( ROLE_DATABASE ))         && parts+=("database")
     (( ROLE_MAIL ))             && parts+=("mail")
+    (( ROLE_ZIMBRA ))           && parts+=("zimbra")
     (( ROLE_DNS ))              && parts+=("dns")
     (( ROLE_PROXMOX ))          && parts+=("proxmox")
     (( ROLE_HYPERVISOR ))       && parts+=("hypervisor")
