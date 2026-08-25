@@ -289,9 +289,26 @@ test_false_positives() {
     assert_severity "$out" "emojis.js" NOT_CRITICAL ""
     check "TinyMCE emoji database (slot_machine/casino) is NOT CRITICAL" "$?"
 
-    ! printf '%s' "$out" | grep -qE '^\[CRITICAL'
+    # Only findings about THIS sandbox count.
+    #
+    # check_web_process_children scans the real /proc of whatever
+    # machine the suite runs on, so a developer workstation with
+    # an unrelated nginx/php-fpm container raises a genuine
+    # CRITICAL that has nothing to do with the fixture. Judging
+    # the whole output made this test fail on the machine rather
+    # than on the code.
+    #
+    # This was invisible until the role module stopped crashing:
+    # the run used to abort before ever reaching the webshell
+    # module.
+    local sandbox_criticals
+    sandbox_criticals="$(printf '%s' "$out" \
+        | grep -A1 -E '^\[CRITICAL' \
+        | grep -F "$root" || true)"
+
+    [[ -z "$sandbox_criticals" ]]
     check "a normal site produces no CRITICAL finding" "$?" \
-          "$(printf '%s' "$out" | grep -E '^\[CRITICAL' | head -2)"
+          "$sandbox_criticals"
 }
 
 # ============================================================
@@ -1404,6 +1421,89 @@ test_notify_secret() {
 # decides.
 # ------------------------------------------------------------
 # ------------------------------------------------------------
+# String comparisons must never sit inside (( )).
+#
+# Bash arithmetic re-evaluates a variable's STRING VALUE as
+# another variable name. With ROLE_WEB_SERVER="nginx", the
+# expression
+#
+#     (( service_managed && (upstream || ROLE_WEB_SERVER != "none") ))
+#
+# dereferenced a variable literally called nginx. Unset, and
+# set -u turns that into a hard abort - which killed the whole
+# run at the very first module, so "itm-security triage" and
+# "itm-security remediate" produced nothing at all on a
+# production host.
+#
+# It crashed for EVERY value ("nginx", "apache", "none", empty),
+# and only fired once a host had a real service-managed Node
+# listener, which is why it hid for so long.
+#
+# The guard is twofold: prove the fixed expression survives every
+# combination, and keep the broken shape from coming back.
+# ------------------------------------------------------------
+test_role_string_in_arithmetic() {
+
+    want "role-arith" || return 0
+    printf '\nTEST: no string comparison inside (( )) in role detection\n'
+
+    # --- the shape must not reappear anywhere ----------------
+    local offenders
+    offenders="$(grep -nE '\(\([^)]*(==|!=)[^)]*"' \
+        "$REPO_DIR"/modules/*.sh "$REPO_DIR"/lib/*.sh 2>/dev/null \
+        | grep -v '\[\[' || true)"
+
+    [[ -z "$offenders" ]]
+    check "no (( )) block compares against a quoted string" "$?" "$offenders"
+
+    # --- and the real expression survives every combination ---
+    local expr_line ws sm up out crashed=0 wrong=0
+    expr_line="$(grep -n 'service_managed' "$REPO_DIR/modules/audit_role.sh" \
+        | grep 'ROLE_WEB_SERVER' | head -1)"
+    [[ -n "$expr_line" ]]
+    check "the node-application decision line is present" "$?"
+
+    for ws in nginx apache none ""; do
+        for sm in 0 1; do
+            for up in 0 1; do
+                out="$(bash -uc "
+                    ROLE_WEB_SERVER='$ws'; service_managed=$sm; upstream=$up
+                    if (( service_managed )) && { (( upstream )) || [[ \"\$ROLE_WEB_SERVER\" != 'none' ]]; }; then
+                        echo yes
+                    else
+                        echo no
+                    fi" 2>&1)" || crashed=1
+                case "$out" in
+                    yes|no) ;;
+                    *) crashed=1 ;;
+                esac
+
+                # A Node listener only counts when it is service
+                # managed. Without a web server in front it must
+                # also be serving 80/443 itself.
+                local want_result="no"
+                if (( sm )); then
+                    if (( up )) || [[ "$ws" != "none" ]]; then
+                        want_result="yes"
+                    fi
+                fi
+                [[ "$out" == "$want_result" ]] || wrong=1
+            done
+        done
+    done
+
+    (( crashed == 0 ))
+    check "the expression never aborts under set -u (16 combinations)" "$?"
+
+    (( wrong == 0 ))
+    check "node-application classification stays correct" "$?"
+
+    # --- the module still parses -----------------------------
+    bash -n "$REPO_DIR/modules/audit_role.sh" 2>/dev/null
+    check "audit_role.sh is valid bash" "$?"
+}
+
+# ------------------------------------------------------------
 # Apache is called something different on each family.
 #
 #   Debian / Ubuntu          apache2ctl, service apache2
@@ -1936,6 +2036,7 @@ test_ioc_masked_unit
 test_ioc_toolchain_variants
 test_ioc_stderr_family
 test_pam_generated_multidistro
+test_role_string_in_arithmetic
 test_apache_multidistro
 test_systemd_override
 test_systemd_reasons

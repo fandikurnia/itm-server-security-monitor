@@ -11,6 +11,35 @@ set -euo pipefail
 #   AlmaLinux / Rocky Linux / RHEL compatible
 # ============================================================
 
+# Under "set -e" a failing command aborts the installer with no
+# output at all. An operator then sees the run stop mid-way -
+# "[+] Checking Telegram configuration..." and nothing after it -
+# with no indication of what failed or where to look.
+#
+# Report the line, the command and the exit status instead, and
+# name the causes that actually produce this in the field:
+# immutable attributes left behind by incident hardening are the
+# usual one, because chattr +i makes chown/chmod fail even for
+# root.
+install_failed() {
+    local rc=$? line=$1 cmd=$2
+    echo >&2
+    echo "[ERROR] Installer aborted at line ${line} (exit ${rc})." >&2
+    echo "        Command: ${cmd}" >&2
+    echo >&2
+    echo "        Common causes:" >&2
+    echo "          - immutable attribute set (chattr +i) on a target file or directory" >&2
+    echo "            check: lsattr -d /etc/security-monitor" >&2
+    echo "                   lsattr /etc/security-monitor/*" >&2
+    echo "            clear: chattr -i <path>   (only if you set it deliberately)" >&2
+    echo "          - read-only mount, or a full filesystem" >&2
+    echo "          - a required command missing on this distribution" >&2
+    echo >&2
+    echo "        Re-run with 'bash -x install.sh 2>&1 | tail -40' for the full trace." >&2
+    exit "$rc"
+}
+trap 'install_failed "$LINENO" "$BASH_COMMAND"' ERR
+
 if [[ $EUID -ne 0 ]]; then
     echo "[ERROR] Run installer as root." >&2
     exit 1
