@@ -1442,6 +1442,73 @@ test_notify_secret() {
 # The guard is twofold: prove the fixed expression survives every
 # combination, and keep the broken shape from coming back.
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# An audit that dies must say so.
+#
+# Under set -u an unbound variable is fatal to the whole shell.
+# When that happened inside the first module the operator saw a
+# bare one-line shell error and nothing else: no summary, no
+# JSON, no Telegram alert. On a host that may be compromised,
+# that is indistinguishable from an audit that found nothing.
+#
+# The run still dies - proper per-module isolation needs findings
+# to be aggregated through files instead of shell state - but it
+# now names the module and states plainly that the result must
+# not be read as clean.
+# ------------------------------------------------------------
+test_audit_abort_is_reported() {
+
+    want "abort-report" || return 0
+    printf '\nTEST: an aborted audit reports which module killed it\n'
+
+    setup_case abort-report
+
+    # A throwaway copy of the tree, so a deliberately broken
+    # module never touches the real one.
+    local fake="$CASE_DIR/repo"
+    mkdir -p "$fake"
+    cp -r "$REPO_DIR/bin" "$REPO_DIR/lib" "$REPO_DIR/modules" "$fake/"
+
+    cat > "$fake/modules/audit_health.sh" <<'BROKEN'
+run_audit_health() {
+    module_begin health "Monitor Health"
+    local x="${DELIBERATELY_UNSET_FOR_TEST}"
+}
+BROKEN
+
+    local out
+    out="$(
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" \
+        ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        timeout 120 "$fake/bin/itm-security" audit health --dry-run 2>&1
+    )"
+
+    printf '%s' "$out" | grep -q 'AUDIT ABORTED inside module'
+    check "the abort is reported, not silent" "$?" "$out"
+
+    printf '%s' "$out" | grep -q "module 'health'"
+    check "the failing module is named" "$?"
+
+    printf '%s' "$out" | grep -qF 'Do NOT read this as a clean result'
+    check "the operator is warned the result is not clean" "$?"
+
+    printf '%s' "$out" | grep -q 'INCOMPLETE'
+    check "the run is declared incomplete" "$?"
+
+    # --- and a healthy run must stay quiet -------------------
+    local clean
+    clean="$(
+        ITM_CONF_DIR="$CASE_DIR/conf" ITM_LOG_DIR="$CASE_DIR/log" \
+        ITM_STATE_DIR="$CASE_DIR/state" ITM_SCAN_STATE_DIR="$CASE_DIR/state/scan" \
+        ITM_EVIDENCE_DIR="$CASE_DIR/state/ev" ITM_ROLE_CACHE="$CASE_DIR/state/role.conf" \
+        timeout 120 "$REPO_DIR/bin/itm-security" audit role --dry-run 2>&1
+    )"
+
+    ! printf '%s' "$clean" | grep -q 'AUDIT ABORTED'
+    check "a healthy run raises no abort warning" "$?"
+}
+
 test_role_string_in_arithmetic() {
 
     want "role-arith" || return 0
@@ -2036,6 +2103,7 @@ test_ioc_masked_unit
 test_ioc_toolchain_variants
 test_ioc_stderr_family
 test_pam_generated_multidistro
+test_audit_abort_is_reported
 test_role_string_in_arithmetic
 test_apache_multidistro
 test_systemd_override
